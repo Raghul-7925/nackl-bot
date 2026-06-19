@@ -1,0 +1,14 @@
+{
+  "name": "nackl-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@teamgosh/bee-sdk": "latest",
+    "@tvmsdk/core": "latest",
+    "@tvmsdk/lib-node": "latest",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.1",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
