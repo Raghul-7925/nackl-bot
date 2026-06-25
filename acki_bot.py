@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Acki Nacki Wallet Bot
-Uses mainnet.ackinacki.org/graphql + ever-sdk for TVM decoding.
+Acki Nacki Wallet Bot — with TVM SDK for accurate address derivation & BOC decoding.
+
+Requirements:
+  pip install httpx python-telegram-bot ton-client-py
 
 Run:
   python acki_bot.py bot <TOKEN>
   python acki_bot.py test <name_or_address>
 """
 
-import asyncio, base64, json, logging, os, re, struct, threading
+import asyncio, base64, json, logging, os, re, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 import httpx
@@ -16,47 +18,177 @@ import httpx
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Network ────────────────────────────────────────────────────────────────────
-GRAPHQL = "https://mainnet.ackinacki.org/graphql"
-HEADERS = {
-    "Content-Type": "text/plain",
-    "Origin": "https://acki.live",
-    "Referer": "https://acki.live/",
-}
+# ══════════════════════════════════════════════════════════════════════
+# CONSTANTS  (extracted from acki.live source)
+# ══════════════════════════════════════════════════════════════════════
 
-# ── Known addresses (from chunk-R33FNBXU.js) ──────────────────────────────────
-ADDR_CURRENCY_COLLECTION = "8888888888888888888888888888888888888888888888888888888888888888"
-ADDR_USDC_ROOT           = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+GRAPHQL   = "https://mainnet.ackinacki.org/graphql"
+GQL_HDR   = {"Content-Type": "text/plain", "Origin": "https://acki.live"}
 
-# ── Code hashes (from chunk-VZWIGR4W.js) ──────────────────────────────────────
+# Currency IDs confirmed from chunk-F5RX2E5J.js: Hn = {nackl:"1", shell:"2", usdc:"3"}
+# In balance_other: NACKL=1, USDC=3
+# Native `balance` field = SHELL (9 decimals)
+NACKL_ID  = 1
+USDC_ID   = 3
+NACKL_DEC = 9
+USDC_DEC  = 6
+SHELL_DEC = 9
+
+# Contract code hashes
 HASH_MV    = "6cc8128da9cda444e4ad83fc7064ea51c6a0bbf0e2aa4777d0807e8ed7283cdb"
 HASH_POPIT = "18e57fc187e8ac1cc2a9b1e8907e291cd925c840c1f93d2f30fe12747dd90126"
 HASH_IDXR  = "f5580a523a708377e8fadc17265def99bed081988d9b9f37e153b938390e3245"
 
-# ── Default currency map (from chunk-VZWIGR4W.js: var g = new Map([[3,{USDC}]]))
-# Currency IDs are blockchain-defined; we load them from CurrencyCollection.
-# Fallback defaults based on observed behaviour + the hardcoded USDC=3 in source.
-DEFAULT_CURRENCIES = {
-    0: {"name": "SHELL",   "decimals": 9},   # native balance field
-    3: {"name": "USDC",    "decimals": 6},   # hardcoded in source
-    # NACKL id is dynamic — discovered from CurrencyCollection contract
-}
+# ── ABIs extracted from chunk-F5RX2E5J.js ─────────────────────────────────────
 
-# ── GraphQL helper ─────────────────────────────────────────────────────────────
+INDEXER_ABI = {"ABI version":2,"version":"2.4","header":["pubkey","time","expire"],"functions":[{"name":"constructor","inputs":[{"name":"wallet","type":"address"},{"name":"rootPubkey","type":"uint256"},{"name":"index","type":"uint128"},{"name":"root","type":"address"}],"outputs":[]},{"name":"getDetails","inputs":[],"outputs":[{"name":"name","type":"string"},{"name":"wallet","type":"address"}]},{"name":"getVersion","inputs":[],"outputs":[{"name":"value0","type":"string"},{"name":"value1","type":"string"}]}],"events":[],"fields":[{"init":True,"name":"_pubkey","type":"uint256"},{"init":False,"name":"_timestamp","type":"uint64"},{"init":False,"name":"_constructorFlag","type":"bool"},{"init":True,"name":"_name","type":"string"},{"init":False,"name":"_wallet","type":"address"},{"init":False,"name":"_root","type":"address"},{"init":False,"name":"_rootPubkey","type":"uint256"}]}
+
+POPIT_ABI = {"ABI version":2,"version":"2.4","header":["pubkey","time","expire"],"functions":[{"name":"constructor","inputs":[{"name":"code","type":"map(uint8,cell)"},{"name":"root_pubkey","type":"uint256"},{"name":"index","type":"uint128"}],"outputs":[]},{"name":"setMbiCur","inputs":[{"name":"mbiCur","type":"uint64"}],"outputs":[]},{"name":"getDetails","inputs":[],"outputs":[{"name":"owner","type":"address"},{"name":"root","type":"address"},{"name":"startTime","type":"uint32"},{"name":"mbiCur","type":"uint64"},{"name":"boost","type":"address"},{"name":"rewards","type":"uint128"},{"name":"minstake","type":"uint128"}]},{"name":"getVersion","inputs":[],"outputs":[{"name":"value0","type":"string"},{"name":"value1","type":"string"}]}],"events":[],"fields":[{"init":True,"name":"_pubkey","type":"uint256"},{"init":False,"name":"_timestamp","type":"uint64"},{"init":False,"name":"_constructorFlag","type":"bool"},{"init":False,"name":"_code","type":"map(uint8,cell)"},{"init":True,"name":"_owner","type":"address"},{"init":False,"name":"_mbiCur","type":"uint64"},{"init":False,"name":"_root","type":"address"},{"init":False,"name":"_startTime","type":"uint32"},{"init":False,"name":"_root_pubkey","type":"uint256"},{"init":False,"name":"_boost","type":"address"},{"init":False,"name":"_rewards","type":"uint128"}]}
+
+# TVC codes (base64 BOC) extracted from chunk-F5RX2E5J.js
+INDEXER_CODE = "te6ccgECIwEABTUABCSK7VMg4wMgwP/jAiDA/uMC8gseAwEiArSNCGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAT4aSHbPNMAAY4igwjXGCD4KMjOzsn5AAHTAAGU0/9QM5MC+ELiIPhl+RDyqJXTAAHyeuLTPwEcAgFO+EMhufK0IPgjgQPoqIIg94rA3o6A3vgAkvAOlIAg94pA3rOl99CTVM52+A/SaG1g+kAx0NMDAcchkl8E4AHTPwHtRNDXCx+DFv79wT/4PfpA1NHQ0wfU0dDTB9Mf0//TD9P/0wf0BPQF+Gj4Z/hm+GP4Yo6A2CL4SfhKxwXy4+j4ACT4SoBA9A6OgN/4RvJzcfhm4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4uIw0x8B+CO88rki+E/A/5Jt"
+
+POPIT_CODE = "te6ccgECPAEACZQABCSK7VMg4wMgwP/jAiDA/uMC8gs3AwE7ArSNCGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAT4aSHbPNMAAY4igwjXGCD4KMjOzsn5AAHTAAGU0/9QM5MC+ELiIPhl+RDyqJXTAAHyeuLTPwE2AgFO+EMhufK0IPgjgQPoqIIg94rA3o6A3vgAkvAOlIAg94pA3rOl99CTVM52+A/SaG1g+kAx0NMDAcchkl8E4AHTPwHtRNDXCx+DFv79wT/4PfpA1NHQ0wfU0dDTB9Mf0//TD9P/0wf0BPQF+Gj4Z/hm+GP4Yo6A2CL4SfhKxwXy4+j4ACT4SoBA9A6OgN/4RvJzcfhm4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4uIw0x8B+CO88rki+E/A/5JtXw3xwAKSbV8N4iCUMCDTHwHbMeBb2zxb"
+
+# ══════════════════════════════════════════════════════════════════════
+# TVM SDK  (ton-client-py)
+# ══════════════════════════════════════════════════════════════════════
+
+_tvm_client = None
+
+def get_tvm_client():
+    """Return a singleton TonClient connected to mainnet.ackinacki.org."""
+    global _tvm_client
+    if _tvm_client is not None:
+        return _tvm_client
+    try:
+        from tonclient.client import TonClient
+        from tonclient.types import ClientConfig, NetworkConfig
+        cfg = ClientConfig()
+        cfg.network = NetworkConfig(
+            endpoints=["https://mainnet.ackinacki.org/graphql"],
+        )
+        _tvm_client = TonClient(config=cfg, is_async=True)
+        log.info("TVM client initialised")
+    except ImportError:
+        log.warning("ton-client-py not installed — TVM features disabled")
+        _tvm_client = None
+    except Exception as e:
+        log.warning("TVM client init failed: %s", e)
+        _tvm_client = None
+    return _tvm_client
+
+
+async def tvm_get_indexer_address(name: str) -> Optional[str]:
+    """
+    Derive the Indexer contract address from a wallet name.
+    Replicates: tvmClientService.getIndexerAddressByName(name)
+      → encode_message(IndexerABI, initial_data={_pubkey:"0x0", _name:name})
+    """
+    client = get_tvm_client()
+    if not client:
+        return None
+    try:
+        from tonclient.types import (
+            ParamsOfEncodeMessage, Abi, AbiType,
+            DeploySet, Signer, SignerType,
+        )
+        abi = Abi(type=AbiType.JSON, value=json.dumps(INDEXER_ABI))
+        deploy = DeploySet(
+            tvc=INDEXER_CODE,
+            initial_data={"_pubkey": "0x0", "_name": name.lower()},
+        )
+        signer = Signer(type=SignerType.NONE)
+        params = ParamsOfEncodeMessage(abi=abi, deploy_set=deploy, signer=signer)
+        result = await client.abi.encode_message(params=params)
+        addr = result.address  # "0:hex64"
+        return addr.split(":")[-1].lower()
+    except Exception as e:
+        log.warning("tvm_get_indexer_address(%s): %s", name, e)
+        return None
+
+
+async def tvm_get_popit_address(mv_hex_id: str) -> Optional[str]:
+    """
+    Derive the PopitGame contract address from the MvMultifactor address.
+    Replicates: tvmClientService.getPopitGameAddress(mv_id)
+      → encode_message(PopitGameABI, initial_data={_pubkey:"0x0", _owner:"0:mv_hex"})
+    """
+    client = get_tvm_client()
+    if not client:
+        return None
+    try:
+        from tonclient.types import (
+            ParamsOfEncodeMessage, Abi, AbiType,
+            DeploySet, Signer, SignerType,
+        )
+        abi    = Abi(type=AbiType.JSON, value=json.dumps(POPIT_ABI))
+        deploy = DeploySet(
+            tvc=POPIT_CODE,
+            initial_data={"_pubkey": "0x0", "_owner": f"0:{mv_hex_id}"},
+        )
+        signer = Signer(type=SignerType.NONE)
+        params = ParamsOfEncodeMessage(abi=abi, deploy_set=deploy, signer=signer)
+        result = await client.abi.encode_message(params=params)
+        addr = result.address
+        return addr.split(":")[-1].lower()
+    except Exception as e:
+        log.warning("tvm_get_popit_address(%s): %s", mv_hex_id, e)
+        return None
+
+
+async def tvm_decode_indexer_data(data_boc: str) -> Optional[dict]:
+    """
+    Decode Indexer contract data BOC → {_name, _wallet}.
+    Replicates: tvmClientService.decodeAccountData(data, IndexerABI)
+    """
+    client = get_tvm_client()
+    if not client:
+        return None
+    try:
+        from tonclient.types import ParamsOfDecodeAccountData, Abi, AbiType
+        abi    = Abi(type=AbiType.JSON, value=json.dumps(INDEXER_ABI))
+        params = ParamsOfDecodeAccountData(abi=abi, data=data_boc)
+        result = await client.abi.decode_account_data(params=params)
+        return result.data  # {"_name": "raghul", "_wallet": "0:8c47...", ...}
+    except Exception as e:
+        log.warning("tvm_decode_indexer_data: %s", e)
+        return None
+
+
+async def tvm_decode_popit_data(data_boc: str) -> Optional[dict]:
+    """
+    Decode PopitGame contract data BOC → {_mbiCur, _rewards, _startTime, ...}.
+    Replicates: tvmClientService.decodeAccountData(data, PopitGameABI)
+    """
+    client = get_tvm_client()
+    if not client:
+        return None
+    try:
+        from tonclient.types import ParamsOfDecodeAccountData, Abi, AbiType
+        abi    = Abi(type=AbiType.JSON, value=json.dumps(POPIT_ABI))
+        params = ParamsOfDecodeAccountData(abi=abi, data=data_boc)
+        result = await client.abi.decode_account_data(params=params)
+        return result.data  # {"_mbiCur": "64", "_rewards": "...", "_startTime": "..."}
+    except Exception as e:
+        log.warning("tvm_decode_popit_data: %s", e)
+        return None
+
+# ══════════════════════════════════════════════════════════════════════
+# GraphQL helpers
+# ══════════════════════════════════════════════════════════════════════
 
 async def gql(client: httpx.AsyncClient, query: str, variables: dict) -> dict:
     r = await client.post(
         GRAPHQL,
         content=json.dumps({"query": query, "variables": variables}),
-        headers=HEADERS, timeout=20,
+        headers=GQL_HDR, timeout=20,
     )
     r.raise_for_status()
     body = r.json()
     if "errors" in body:
         raise ValueError(body["errors"][0]["message"])
     return body.get("data", {})
-
-# ── Queries ────────────────────────────────────────────────────────────────────
 
 Q_ACCOUNT = """
 query GetAccount($a: String!, $d: String!) {
@@ -71,20 +203,7 @@ query GetAccount($a: String!, $d: String!) {
       }
     }
   }
-}
-"""
-
-Q_RUN_GET = """
-query RunGet($a: String!, $d: String!, $fn: String!) {
-  blockchain {
-    account(account_id: $a, dapp_id: $d) {
-      info {
-        run_get { method(name: $fn) { output } }
-      }
-    }
-  }
-}
-"""
+}"""
 
 Q_TXNS = """
 query GetTxns($a: String!, $d: String!, $n: Int!) {
@@ -98,23 +217,9 @@ query GetTxns($a: String!, $d: String!, $n: Int!) {
       }
     }
   }
-}
-"""
+}"""
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def is_addr(s: str) -> bool:
-    s = s.strip()
-    return bool(re.match(r'^-?\d+:[a-fA-F0-9]{64}$', s)
-             or re.match(r'^[a-fA-F0-9]{64}$', s))
-
-def hex_id(addr: str) -> str:
-    """Strip workchain prefix → bare 64-char hex."""
-    m = re.match(r'^-?\d+:([a-fA-F0-9]{64})$', addr.strip())
-    return m.group(1).lower() if m else addr.strip().lower()
-
-async def fetch_info(client, aid):
-    """Fetch account info dict or None."""
+async def fetch_info(client: httpx.AsyncClient, aid: str) -> Optional[dict]:
     try:
         d = await gql(client, Q_ACCOUNT, {"a": aid, "d": aid})
         return d.get("blockchain", {}).get("account", {}).get("info")
@@ -122,8 +227,21 @@ async def fetch_info(client, aid):
         log.warning("fetch_info(%s): %s", aid, e)
         return None
 
+# ══════════════════════════════════════════════════════════════════════
+# Utilities
+# ══════════════════════════════════════════════════════════════════════
+
+def is_addr(s: str) -> bool:
+    s = s.strip()
+    return bool(re.match(r'^-?\d+:[a-fA-F0-9]{64}$', s)
+             or re.match(r'^[a-fA-F0-9]{64}$', s))
+
+def hex_id(addr: str) -> str:
+    m = re.match(r'^-?\d+:([a-fA-F0-9]{64})$', addr.strip())
+    return m.group(1).lower() if m else addr.strip().lower()
+
 def fmt(raw, dec=9, show=2):
-    if not raw or raw == "0":
+    if not raw or str(raw) == "0":
         return f"0.{'0'*show}"
     try:
         n = int(raw)
@@ -133,368 +251,183 @@ def fmt(raw, dec=9, show=2):
     except Exception:
         return f"0.{'0'*show}"
 
-# ── Currency map from CurrencyCollection ──────────────────────────────────────
-
-async def load_currency_map(client: httpx.AsyncClient) -> dict:
-    """
-    Load currency ID → {name, decimals} from CurrencyCollection contract.
-    Falls back to DEFAULT_CURRENCIES on any error.
-    
-    The CurrencyCollection data BOC encodes a map of extra currencies.
-    We try to call run_get on the contract; if unsupported, scan the data BOC.
-    """
-    result = dict(DEFAULT_CURRENCIES)
-    try:
-        info = await fetch_info(client, ADDR_CURRENCY_COLLECTION)
-        if not info or not info.get("data"):
-            return result
-        
-        # Parse data BOC — currency entries look like:
-        # key (uint32) + name (string) + decimals (uint8)
-        raw = base64.b64decode(info["data"])
-        
-        # Simple heuristic: find ASCII name strings near numeric currency IDs
-        # We scan for patterns like: \x00\x00\x00\x01 + "NACKL\x00" (len-prefixed)
-        # or just scan for known token name strings
-        text = raw.decode("latin-1")
-        
-        # Find NACKL and its preceding currency ID
-        for name in ["NACKL", "nackl"]:
-            pos = text.find(name)
-            if pos > 4:
-                # Look at the 4 bytes before the string for currency ID
-                for offset in range(1, 20):
-                    if pos - offset >= 0:
-                        try:
-                            cid = struct.unpack(">I", raw[pos-offset:pos-offset+4])[0]
-                            if 1 <= cid <= 100:
-                                result[cid] = {"name": "NACKL", "decimals": 9}
-                                log.info("NACKL currency ID = %d", cid)
-                                break
-                        except Exception:
-                            pass
-    except Exception as e:
-        log.warning("load_currency_map: %s", e)
-    
-    return result
-
-# ── Name resolution ────────────────────────────────────────────────────────────
-#
-# Flow (from chunk-VZWIGR4W.js getLinkedAccounts):
-#   1. getName() → decodeAccountData(MvMultifactor ABI) → _name
-#   2. getIndexerAddressByName(name) → TVM encode_message(IndexerABI, {_name}) → address
-#   3. getPopitGameAddress(mv_id) → TVM encode_message(PopitGameABI, {_owner}) → address
-#
-# Without TVM SDK, we use these alternatives:
-#   - Try name as account_id directly (server may resolve)
-#   - Use dapp_id field to find linked PopitGame
-
-async def resolve_identifier(client: httpx.AsyncClient, identifier: str):
-    """
-    Returns (account_id, wallet_name) tuple.
-    account_id is bare 64-char hex of the MvMultifactor.
-    wallet_name is the human name or None.
-    """
-    identifier = identifier.strip()
-
-    if is_addr(identifier):
-        aid = hex_id(identifier)
-        return aid, None
-
-    # It's a name — try querying with name as account_id
-    name_lower = identifier.lower()
-    info = await fetch_info(client, name_lower)
-    if info and info.get("code_hash"):
-        return name_lower, identifier
-    
-    raise ValueError(
-        f"Wallet *'{identifier}'* not found.\n\n"
-        "Please use the full address:\n"
-        "`/wallet 0:8c478bedb9ffdb890f1e82de78d5edbb0f2af2d4162952a41a99ab9c22871ae7`"
-    )
-
-# ── PopitGame lookup ───────────────────────────────────────────────────────────
-
-async def find_popit(client: httpx.AsyncClient, mv_id: str, mv_info: dict) -> Optional[str]:
-    """
-    Find the PopitGame contract for a given MvMultifactor account_id.
-    
-    The correct method (from source) requires TVM SDK to compute:
-      encode_message(PopitGameABI, initial_data={_pubkey:0x0, _owner: mv_address})
-    
-    We use the dapp_id as a heuristic — the PopitGame shares the dapp_id of MvMultifactor.
-    The dapp_id in account info points to the "dapp root" which is the PopitGame address.
-    """
-    dapp_id = mv_info.get("dapp_id")
-    if dapp_id:
-        pid = hex_id(dapp_id)
-        if pid != mv_id:
-            # Verify it's actually a PopitGame
-            pinfo = await fetch_info(client, pid)
-            if pinfo:
-                ch = pinfo.get("code_hash", "")
-                ich = pinfo.get("init_code_hash", "")
-                if ch == HASH_POPIT or ich == HASH_POPIT:
-                    return pid
-    
-    # dapp_id == mv_id or not set — we can't derive the address without TVM SDK
-    # BUT: we can query the GraphQL with mv_id as dapp_id for the PopitGame
-    # The PopitGame's _owner = mv_address, so its dapp_id = mv_address
-    # Try: account_id = any_value, dapp_id = mv_id — won't work without knowing account_id
-    
-    return None
-
-# ── PopitGame data ─────────────────────────────────────────────────────────────
-
-async def get_popit_data(client: httpx.AsyncClient, popit_id: str, currency_map: dict):
-    """
-    Get NACKL locked balance, MBI level, and speed from PopitGame.
-    
-    Speed formula (from ABI getDetails output: rewards, startTime):
-      speed_nackl_24h = rewards / (now - startTime) * 86400 / 10^9
-    
-    But we read directly from balances + data BOC for mbiCur.
-    """
-    result = {"locked": "0", "mbi": 0, "speed": 0.0}
-    
-    info = await fetch_info(client, popit_id)
-    if not info:
-        return result
-    
-    # NACKL locked = balance_other where currency name == NACKL
-    nackl_id = next((k for k, v in currency_map.items() if v.get("name") == "NACKL"), None)
-    for b in info.get("balance_other") or []:
-        if nackl_id is not None and b.get("currency") == nackl_id:
-            result["locked"] = b.get("value", "0") or "0"
-    
-    # MBI level + speed from data BOC (decoded from _mbiCur and _rewards/_startTime)
-    if info.get("data"):
-        result["mbi"], result["speed"] = decode_popit_boc(info["data"])
-    
-    return result
-
-def decode_popit_boc(data_b64: str):
-    """
-    Extract _mbiCur (uint64) and speed from PopitGame data BOC.
-    
-    PopitGame fields (from ABI):
-      _pubkey(uint256), _timestamp(uint64), _constructorFlag(bool),
-      _code(map), _owner(address=267bits), _mbiCur(uint64),
-      _root(address), _startTime(uint32), _root_pubkey(uint256),
-      _boost(address), _rewards(uint128)
-    
-    TVM serializes these as a bitstream. Without TVM SDK we use heuristics.
-    """
-    try:
-        raw = base64.b64decode(data_b64)
-        
-        mbi = 0
-        speed = 0.0
-        
-        # Heuristic: scan for uint64 in range 1-500 (MBI level)
-        # MBI levels are 1-500 based on game design
-        for i in range(len(raw) - 8):
-            val = struct.unpack(">Q", raw[i:i+8])[0]
-            if 1 <= val <= 500:
-                mbi = int(val)
-                break
-        
-        # Speed from _rewards (uint128) and _startTime (uint32)
-        # rewards / (now - startTime) * 86400 = NACKL/24h
-        import time
-        now = int(time.time())
-        
-        # Look for reasonable _startTime (unix timestamp ~2023-2025)
-        start_time = 0
-        for i in range(len(raw) - 4):
-            val = struct.unpack(">I", raw[i:i+4])[0]
-            if 1_680_000_000 <= val <= now:  # 2023-04-08 to now
-                start_time = val
-                break
-        
-        # Look for _rewards (uint128, large number in NACKL nanotons)
-        # A typical reward might be 1,000-100,000 NACKL = 1e12 to 1e14 nanotons
-        if start_time > 0:
-            for i in range(len(raw) - 16):
-                val = int.from_bytes(raw[i:i+16], 'big')
-                if 1e11 <= val <= 1e18:  # 100 to 1 billion NACKL
-                    elapsed = now - start_time
-                    if elapsed > 0:
-                        speed = (val / 1e9) * (86400 / elapsed)
-                    break
-        
-        return mbi, speed
-        
-    except Exception as e:
-        log.warning("decode_popit_boc: %s", e)
-        return 0, 0.0
-
-# ── Transaction analysis ───────────────────────────────────────────────────────
-
-async def get_tx_stats(client: httpx.AsyncClient, aid: str, nackl_id: Optional[int]):
-    """Calculate speed (NACKL/24h) and tap count from recent transactions."""
-    try:
-        d = await gql(client, Q_TXNS, {"a": aid, "d": aid, "n": 100})
-        nodes = (d.get("blockchain", {})
-                  .get("account", {})
-                  .get("transactions", {})
-                  .get("nodes", []))
-    except Exception as e:
-        log.warning("get_tx_stats: %s", e)
-        return 0.0, 0
-
-    if not nodes:
-        return 0.0, 0
-
-    now_ts = max((t.get("now", 0) for t in nodes), default=0)
-    cutoff = now_ts - 86400
-    taps = 0
-    earned = 0
-
-    for tx in nodes:
-        ts = tx.get("now", 0)
-        for d in tx.get("balance_delta_other") or []:
-            # Match by currency ID if we know it, else treat any positive delta as NACKL reward
-            cid = d.get("currency", -1)
-            is_nackl = (nackl_id is not None and cid == nackl_id) or \
-                       (nackl_id is None and cid not in (0, 3))  # not SHELL or USDC
-            try:
-                v = int(d.get("value", "0"))
-            except (ValueError, TypeError):
-                v = 0
-            if is_nackl and v > 0:
-                if ts >= cutoff:
-                    earned += v
-                taps += 1
-                break  # count each tx once
-
-    window_h = (now_ts - cutoff) / 3600 if now_ts > cutoff else 24
-    speed = (earned / 1e9) * (24 / max(window_h, 0.1))
-    return speed, taps
-
-# ── Name from BOC ──────────────────────────────────────────────────────────────
-
-def name_from_boc(data_b64: str) -> Optional[str]:
-    """Extract wallet name from MvMultifactor data BOC."""
-    try:
-        raw = base64.b64decode(data_b64)
-        # TVM stores strings as length-prefixed. Scan for short ASCII names.
-        # The _name field is typically 3-24 lowercase alphanum chars.
-        matches = re.findall(rb'[a-z][a-z0-9_\-]{2,23}', raw)
-        blocklist = {b"none", b"null", b"true", b"false", b"data",
-                     b"name", b"type", b"root", b"node"}
-        for m in matches:
-            if m not in blocklist and len(m) >= 3:
-                return m.decode("ascii")
-    except Exception:
-        pass
-    return None
-
-# ── Main lookup ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Main wallet lookup
+# ══════════════════════════════════════════════════════════════════════
 
 async def lookup_wallet(identifier: str) -> dict:
-    async with httpx.AsyncClient() as client:
+    identifier = identifier.strip()
 
-        # 1. Resolve identifier → account_id
-        aid, name = await resolve_identifier(client, identifier)
+    async with httpx.AsyncClient() as http:
 
-        # 2. Load currency map
-        currency_map = await load_currency_map(client)
-        nackl_id = next((k for k, v in currency_map.items()
-                         if v.get("name") == "NACKL"), None)
-        usdc_id = next((k for k, v in currency_map.items()
-                        if v.get("name") == "USDC"), None)
-        log.info("Currency map: %s", currency_map)
+        # ── Step 1: Resolve name → MvMultifactor address ─────────────────────
+        wallet_name: Optional[str] = None
+        mv_id: Optional[str]       = None
 
-        # 3. Fetch MvMultifactor account
-        info = await fetch_info(client, aid)
-        if not info:
-            raise ValueError(f"Account `0:{aid}` not found.")
+        if is_addr(identifier):
+            mv_id = hex_id(identifier)
+        else:
+            wallet_name = identifier
+            name_lower  = identifier.lower()
 
-        code_hash = info.get("code_hash", "")
-        init_hash = info.get("init_code_hash", "")
+            # TVM SDK: derive Indexer address from name
+            indexer_id = await tvm_get_indexer_address(name_lower)
+            log.info("Indexer addr for '%s': %s", name_lower, indexer_id)
 
-        # Extract name from BOC if not resolved from name query
-        if not name and info.get("data"):
-            name = name_from_boc(info["data"])
+            if indexer_id:
+                # Query Indexer contract data to get _wallet (MvMultifactor addr)
+                idxr_info = await fetch_info(http, indexer_id)
+                if idxr_info and idxr_info.get("data"):
+                    decoded = await tvm_decode_indexer_data(idxr_info["data"])
+                    log.info("Indexer decoded: %s", decoded)
+                    if decoded:
+                        wallet_name = decoded.get("_name") or wallet_name
+                        w = decoded.get("_wallet", "")
+                        if w:
+                            mv_id = hex_id(w)
 
-        # 4. Parse balances
-        # SHELL = native balance field (id=0 in the source concat)
-        shell_raw  = info.get("balance", "0") or "0"
-        nackl_raw  = "0"
-        usdc_raw   = "0"
+            if not mv_id:
+                # Fallback: try name directly as account_id
+                info_direct = await fetch_info(http, name_lower)
+                if info_direct and info_direct.get("code_hash"):
+                    mv_id = name_lower
+                else:
+                    raise ValueError(
+                        f"Wallet *'{identifier}'* not found.\n\n"
+                        "Try the full address:\n"
+                        "`/wallet 0:8c478bed...`"
+                    )
 
-        for b in info.get("balance_other") or []:
+        # ── Step 2: Fetch MvMultifactor account info ──────────────────────────
+        mv_info = await fetch_info(http, mv_id)
+        if not mv_info:
+            raise ValueError(f"Account `0:{mv_id}` not found on chain.")
+
+        # ── Step 3: Parse NACKL + USDC + SHELL balances ───────────────────────
+        # SHELL = native balance field
+        # NACKL = balance_other[currency==1]
+        # USDC  = balance_other[currency==3]
+        shell_raw = mv_info.get("balance", "0") or "0"
+        nackl_raw = "0"
+        usdc_raw  = "0"
+
+        for b in mv_info.get("balance_other") or []:
             cid = b.get("currency", -1)
             val = b.get("value", "0") or "0"
-            if nackl_id is not None and cid == nackl_id:
+            if cid == NACKL_ID:
                 nackl_raw = val
-            elif nackl_id is None and cid not in (0, 3):
-                # Assume any unknown non-USDC currency is NACKL
-                nackl_raw = val
-            if usdc_id is not None and cid == usdc_id:
-                usdc_raw = val
-            elif usdc_id is None and cid == 3:
+            elif cid == USDC_ID:
                 usdc_raw = val
 
-        # 5. Find PopitGame
-        popit_id = await find_popit(client, aid, info)
-        log.info("PopitGame id: %s", popit_id)
+        # ── Step 4: Find & query PopitGame contract ───────────────────────────
+        popit_id = await tvm_get_popit_address(mv_id)
+        log.info("PopitGame addr: %s", popit_id)
 
-        locked_raw = "0"
-        mbi = 0
+        locked_raw  = "0"
+        mbi_level   = 0
         popit_speed = 0.0
+        popit_found = False
 
         if popit_id:
-            pd = await get_popit_data(client, popit_id, currency_map)
-            locked_raw  = pd["locked"]
-            mbi         = pd["mbi"]
-            popit_speed = pd["speed"]
+            popit_info = await fetch_info(http, popit_id)
+            if popit_info:
+                popit_found = True
 
-        # 6. Transaction stats (speed + taps)
-        tx_speed, taps = await get_tx_stats(client, aid, nackl_id)
-        
-        # Use popit_speed if available and tx_speed is 0; else use tx_speed
-        speed = popit_speed if (popit_speed > 0 and tx_speed == 0) else tx_speed
+                # NACKL locked = balance_other[currency==1] on PopitGame
+                for b in popit_info.get("balance_other") or []:
+                    if b.get("currency") == NACKL_ID:
+                        locked_raw = b.get("value", "0") or "0"
+
+                # Decode data BOC for _mbiCur + _rewards + _startTime
+                if popit_info.get("data"):
+                    decoded_p = await tvm_decode_popit_data(popit_info["data"])
+                    log.info("PopitGame decoded: %s", decoded_p)
+                    if decoded_p:
+                        mbi_level = int(decoded_p.get("_mbiCur", 0) or 0)
+
+                        # Speed = rewards / elapsed * 86400 (NACKL per 24h)
+                        rewards_raw  = decoded_p.get("_rewards", "0") or "0"
+                        start_time   = decoded_p.get("_startTime", "0") or "0"
+                        try:
+                            rewards  = int(rewards_raw)
+                            start_ts = int(start_time)
+                            now_ts   = int(time.time())
+                            elapsed  = now_ts - start_ts
+                            if elapsed > 0 and rewards > 0:
+                                popit_speed = (rewards / 10**NACKL_DEC) * (86400 / elapsed)
+                        except (ValueError, TypeError):
+                            pass
+
+        # ── Step 5: Transactions → speed + taps ──────────────────────────────
+        tx_speed = 0.0
+        taps     = 0
+        try:
+            d = await gql(http, Q_TXNS, {"a": mv_id, "d": mv_id, "n": 100})
+            nodes = (d.get("blockchain", {})
+                      .get("account", {})
+                      .get("transactions", {})
+                      .get("nodes", []))
+            if nodes:
+                now_ts  = max(t.get("now", 0) for t in nodes)
+                cutoff  = now_ts - 86400
+                earned  = 0
+                for tx in nodes:
+                    ts = tx.get("now", 0)
+                    for delta in tx.get("balance_delta_other") or []:
+                        if delta.get("currency") == NACKL_ID:
+                            try:
+                                v = int(delta.get("value", "0"))
+                                if v > 0:
+                                    if ts >= cutoff:
+                                        earned += v
+                                    taps += 1
+                                    break
+                            except (ValueError, TypeError):
+                                pass
+                window_h = (now_ts - cutoff) / 3600 if now_ts > cutoff else 24
+                tx_speed = (earned / 10**NACKL_DEC) * (24 / max(window_h, 0.1))
+        except Exception as e:
+            log.warning("tx stats: %s", e)
+
+        # Prefer PopitGame speed (more accurate); fall back to tx-derived speed
+        speed = popit_speed if popit_speed > 0 else tx_speed
 
         return {
-            "name":    name or identifier,
-            "address": f"0:{aid}",
-            "nackl":   nackl_raw,
-            "locked":  locked_raw,
-            "usdc":    usdc_raw,
-            "shell":   shell_raw,
-            "speed":   speed,
-            "taps":    taps,
-            "mbi":     mbi,
-            "nackl_id":  nackl_id,
-            "usdc_id":   usdc_id,
-            "popit_found": popit_id is not None,
+            "name":        wallet_name or f"0:{mv_id}",
+            "address":     f"0:{mv_id}",
+            "nackl":       nackl_raw,
+            "locked":      locked_raw,
+            "usdc":        usdc_raw,
+            "shell":       shell_raw,
+            "speed":       speed,
+            "taps":        taps,
+            "mbi":         mbi_level,
+            "popit_found": popit_found,
+            "tvm_ok":      get_tvm_client() is not None,
         }
 
-# ── Format ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Message formatter
+# ══════════════════════════════════════════════════════════════════════
 
 def format_msg(w: dict) -> str:
-    nackl_dec  = DEFAULT_CURRENCIES.get(w.get("nackl_id"), {}).get("decimals", 9)
-    usdc_dec   = DEFAULT_CURRENCIES.get(w.get("usdc_id"),  {}).get("decimals", 6)
-    
     lines = [
         "📊 *Wallet Info*\n",
         f"👤 {w['name']}",
-        f"🪙 NACKL: `{fmt(w['nackl'], 9)}`",
-        f"🔒 Locked: `{fmt(w['locked'], 9)}`",
-        f"💵 USDC: `{fmt(w['usdc'], usdc_dec)}`",
-        f"🐚 SHELL: `{fmt(w['shell'], 9)}`",
+        f"🪙 NACKL: `{fmt(w['nackl'], NACKL_DEC)}`",
+        f"🔒 Locked: `{fmt(w['locked'], NACKL_DEC)}`",
+        f"💵 USDC: `{fmt(w['usdc'], USDC_DEC)}`",
+        f"🐚 SHELL: `{fmt(w['shell'], SHELL_DEC)}`",
         f"⚡ Speed: `{w['speed']:,.2f} NACKL/24h`",
         f"👆 Total taps: `{w['taps']}`",
         f"🎮 MBI Level: `{w['mbi']}`",
         f"\n📍 `{w['address']}`",
     ]
-    if not w["popit_found"]:
-        lines.append("\n_⚠️ Locked/MBI data needs TVM SDK for full accuracy_")
     return "\n".join(lines)
 
-# ── Bot ────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Telegram bot
+# ══════════════════════════════════════════════════════════════════════
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -513,7 +446,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text(
-            "Usage: `/wallet <name or address>`",
+            "Usage: `/wallet <name or address>`\nExample: `/wallet raghul`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -522,31 +455,31 @@ async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🔍 Looking up `{identifier}`…", parse_mode=ParseMode.MARKDOWN
     )
     try:
-        w    = await lookup_wallet(identifier)
+        w = await lookup_wallet(identifier)
         await msg.edit_text(format_msg(w), parse_mode=ParseMode.MARKDOWN)
     except ValueError as e:
         await msg.edit_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        log.exception("lookup error")
+        log.exception("lookup_wallet error")
         await msg.edit_text(f"❌ Error: {e}")
 
-# ── Health server (keeps Render free tier alive) ───────────────────────────────
-
+# ── Health server keeps Render Web Service alive ───────────────────────────────
 class _H(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(b"OK")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def log_message(self, *a): pass
 
 def _health():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(("0.0.0.0", port), _H).serve_forever()
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), _H).serve_forever()
 
-# ── Entry ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════
 
 def run_bot(token: str):
     threading.Thread(target=_health, daemon=True).start()
-    log.info("Health server on port %s", os.environ.get("PORT", 8080))
+    # Pre-warm TVM client
+    get_tvm_client()
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
@@ -555,12 +488,12 @@ def run_bot(token: str):
     app.run_polling(drop_pending_updates=True)
 
 async def _test(q: str):
-    print(f"Looking up: {q}\n")
+    get_tvm_client()  # init
+    print(f"\nLooking up: {q}\n")
     try:
         w = await lookup_wallet(q)
         print(format_msg(w).replace("*","").replace("`",""))
-        print("\nDebug:", {k: v for k, v in w.items()
-                           if k in ("nackl_id","usdc_id","popit_found")})
+        print("\nDebug:", {k: w[k] for k in ("popit_found","tvm_ok","speed")})
     except ValueError as e:
         print(f"Error: {e}")
     except Exception:
