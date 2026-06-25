@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: acki-wallet-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python acki_bot.py bot $TELEGRAM_TOKEN
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
