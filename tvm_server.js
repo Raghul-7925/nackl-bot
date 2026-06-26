@@ -1,206 +1,207 @@
 /**
- * tvm_server.js
- * Tiny HTTP server that wraps tvmsdk.wasm + worker.js for Python to call.
- * 
- * Exposes POST /call  { function: "abi.encode_message", params: {...} }
- * Returns           { result: {...} } or { error: "..." }
- * 
+ * tvm_server.js — Acki Nacki TVM SDK HTTP bridge
+ *
+ * Boots worker_compat.js (which shims Web Worker globals and loads worker.js + tvmsdk.wasm),
+ * creates an SDK context, then serves POST /call for Python to call abi.encode_message etc.
+ *
+ * Files needed in same dir:
+ *   worker_compat.js   (shim — provided)
+ *   worker.js          (from acki.live zip)
+ *   tvmsdk.wasm        (from acki.live / your upload)
+ *
  * Usage:
- *   node tvm_server.js          # listens on port 7799
+ *   node tvm_server.js
  *   TVM_PORT=7799 node tvm_server.js
  */
 
-const http   = require('http');
-const fs     = require('fs');
-const path   = require('path');
+'use strict';
 
-// ── Load the WASM + worker glue ─────────────────────────────────────────────
-// worker.js uses `self.onmessage` pattern (Web Worker style).
-// We shim the Worker globals so it runs in plain Node.js.
+const http               = require('http');
+const path               = require('path');
+const fs                 = require('fs');
+const { Worker }         = require('worker_threads');
 
-const WASM_PATH   = path.join(__dirname, 'tvmsdk.wasm');
-const WORKER_PATH = path.join(__dirname, 'worker.js');
-const PORT        = parseInt(process.env.TVM_PORT || '7799', 10);
+const PORT   = parseInt(process.env.TVM_PORT || '7799', 10);
+const DIR    = __dirname;
 
-// Pending callbacks: requestId → {resolve, reject}
-const pending = new Map();
-let   requestIdCounter = 1;
+// ── State ─────────────────────────────────────────────────────────────────────
+let worker      = null;
+let ready       = false;
+let fatalError  = null;
+let sdkCtx      = null;   // integer context handle from SDK
 
-// ── Shim Web Worker globals ──────────────────────────────────────────────────
-// The worker.js uses `self`, `postMessage`, and `self.onmessage`.
-// We replace these so it runs synchronously in Node.
+const pendingCtx = new Map();  // reqId → {resolve, reject}
+const pendingReq = new Map();  // reqId → {resolve, reject}
+let ctxCounter   = 1;
+let reqCounter   = 1;
 
-let workerOnMessage = null;   // set by worker.js via `self.onmessage = ...`
+// ── Boot ──────────────────────────────────────────────────────────────────────
+async function boot() {
+  // Compile WASM upfront in the main thread (transferable to worker)
+  const wasmBytes  = fs.readFileSync(path.join(DIR, 'tvmsdk.wasm'));
+  const wasmModule = await WebAssembly.compile(
+    wasmBytes.buffer
+      ? wasmBytes.buffer.slice(wasmBytes.byteOffset, wasmBytes.byteOffset + wasmBytes.byteLength)
+      : wasmBytes
+  );
 
-global.self = {
-  onmessage: null,
-  get onmessage() { return workerOnMessage; },
-  set onmessage(fn) { workerOnMessage = fn; },
-  self: global.self,   // self.self (used in worker.js)
-  WorkerGlobalScope: {},
-  indexedDB: null,     // not needed for abi/boc operations
-};
+  worker = new Worker(path.join(DIR, 'worker_compat.js'));
 
-// Messages the worker posts back to us
-global.postMessage = (msg) => {
-  if (msg.type === 'init') {
-    console.log('[tvm] WASM initialised OK');
-    return;
-  }
+  return new Promise((resolve, reject) => {
+    worker.on('error', (err) => {
+      fatalError = err;
+      console.error('[tvm] worker crashed:', err.message);
+      for (const c of pendingCtx.values()) c.reject(err);
+      for (const r of pendingReq.values()) r.reject(err);
+      pendingCtx.clear(); pendingReq.clear();
+      if (!ready) reject(err);
+    });
 
-  if (msg.type === 'createContext') {
-    const cb = pending.get('ctx:' + msg.requestId);
-    if (cb) { pending.delete('ctx:' + msg.requestId); cb.resolve(msg.result); }
-    return;
-  }
+    worker.on('message', (msg) => {
+      switch (msg.type) {
 
-  // SDK responses come via core_response_handler (already handled in worker.js)
-  // but we also receive them here wrapped in postMessage for some paths
-  const cb = pending.get(msg.requestId);
-  if (cb) {
-    pending.delete(msg.requestId);
-    if (msg.type && msg.type.includes('Error')) {
-      cb.reject(new Error(JSON.stringify(msg.error)));
-    } else {
-      cb.resolve(msg.result);
-    }
-  }
-};
+        case 'init':
+          console.log('[tvm] WASM initialised');
+          ready = true;
+          resolve();
+          break;
 
-// ── Intercept core_response_handler calls ───────────────────────────────────
-// worker.js calls `core_response_handler(requestId, params, responseType, finished)`
-// We need to capture these as our actual SDK results.
-// Inject a global that worker.js will call:
-let _origCoreResponseHandler = null;
-global.__captureResponseHandler = (handler) => {
-  _origCoreResponseHandler = handler;
-};
+        case 'initError':
+          fatalError = new Error('init failed: ' + JSON.stringify(msg.error));
+          reject(fatalError);
+          break;
 
-// ── Load and init worker.js ──────────────────────────────────────────────────
-let wasmReady = false;
+        case 'createContext': {
+          const cb = pendingCtx.get(msg.requestId);
+          if (!cb) break;
+          pendingCtx.delete(msg.requestId);
+          try {
+            const parsed = typeof msg.result === 'string' ? JSON.parse(msg.result) : msg.result;
+            const ctx    = (parsed && parsed.result !== undefined) ? parsed.result : parsed;
+            cb.resolve(ctx);
+          } catch(e) { cb.resolve(msg.result); }
+          break;
+        }
 
-async function initWorker() {
-  // Read WASM as ArrayBuffer
-  const wasmBytes = fs.readFileSync(WASM_PATH);
-  const wasmModule = await WebAssembly.compile(wasmBytes.buffer || wasmBytes);
+        case 'createContextError': {
+          const cb = pendingCtx.get(msg.requestId);
+          if (!cb) break;
+          pendingCtx.delete(msg.requestId);
+          cb.reject(new Error(JSON.stringify(msg.error)));
+          break;
+        }
 
-  // Patch worker.js: replace `self.onmessage = ...` handler dispatch
-  // so we can call it directly from Node without postMessage roundtrip
-  let workerSrc = fs.readFileSync(WORKER_PATH, 'utf8');
+        case 'response': {
+          const cb = pendingReq.get(msg.requestId);
+          if (!cb) break;
+          if (!msg.finished) break;   // wait for finished=true
+          pendingReq.delete(msg.requestId);
+          const params = typeof msg.params === 'string' ? JSON.parse(msg.params) : msg.params;
+          // responseType: 0=Success, 1=Error
+          if (msg.responseType === 1) {
+            cb.reject(new Error(JSON.stringify(params)));
+          } else {
+            cb.resolve(params);
+          }
+          break;
+        }
 
-  // Replace the indexed DB calls with no-ops (we don't need caching)
-  // The WASM itself doesn't require IndexedDB for abi/boc operations
+        case 'requestError': {
+          const cb = pendingReq.get(msg.requestId);
+          if (!cb) break;
+          pendingReq.delete(msg.requestId);
+          cb.reject(new Error(JSON.stringify(msg.error)));
+          break;
+        }
 
-  // Execute worker.js in this context
-  const vm = require('vm');
-  const ctx = vm.createContext(global);
-  vm.runInContext(workerSrc, ctx);
-
-  // Send the init message with the compiled WASM module
-  await new Promise((resolve, reject) => {
-    const tmpId = 'init:' + (requestIdCounter++);
-    // Override postMessage temporarily to catch init response
-    const orig = global.postMessage;
-    global.postMessage = (msg) => {
-      if (msg.type === 'init') { global.postMessage = orig; resolve(); }
-      else if (msg.type === 'initError') { global.postMessage = orig; reject(new Error(msg.error)); }
-      else orig(msg);
-    };
-    workerOnMessage({ data: { type: 'init', wasmModule } });
-  });
-
-  wasmReady = true;
-  console.log('[tvm] Worker ready on port', PORT);
-}
-
-// ── Create SDK context ───────────────────────────────────────────────────────
-let sdkContext = null;
-
-async function getContext() {
-  if (sdkContext !== null) return sdkContext;
-
-  const reqId = requestIdCounter++;
-  const result = await new Promise((resolve, reject) => {
-    pending.set('ctx:' + reqId, { resolve, reject });
-    workerOnMessage({
-      data: {
-        type: 'createContext',
-        configJson: JSON.stringify({
-          network: { endpoints: ['https://mainnet.ackinacki.org/graphql'] },
-        }),
-        requestId: reqId,
+        default: break;
       }
     });
-  });
 
-  const parsed = JSON.parse(result);
-  if (parsed.error) throw new Error(parsed.error);
-  sdkContext = parsed.result;
-  console.log('[tvm] Context created:', sdkContext);
-  return sdkContext;
+    // Exactly what Dn() does: postMessage({ type:'init', wasmModule })
+    worker.postMessage({ type: 'init', wasmModule }, [wasmModule]);
+  });
 }
 
-// ── Call SDK function ────────────────────────────────────────────────────────
-function callSdk(functionName, params) {
-  return new Promise(async (resolve, reject) => {
-    const ctx = await getContext();
-    const reqId = requestIdCounter++;
+// ── Create context ────────────────────────────────────────────────────────────
+function createCtx(configJson) {
+  return new Promise((resolve, reject) => {
+    const id = ctxCounter++;
+    pendingCtx.set(id, { resolve, reject });
+    worker.postMessage({ type: 'createContext', requestId: id, configJson });
+  });
+}
 
-    // The worker calls core_response_handler which calls postMessage
-    // We intercept via the pending map keyed by reqId
-    const timeout = setTimeout(() => {
-      pending.delete(reqId);
-      reject(new Error('SDK timeout: ' + functionName));
+// ── SDK call ──────────────────────────────────────────────────────────────────
+function sdkCall(functionName, params) {
+  return new Promise((resolve, reject) => {
+    const id = reqCounter++;
+    const timer = setTimeout(() => {
+      pendingReq.delete(id);
+      reject(new Error(`Timeout: ${functionName}`));
     }, 15000);
 
-    // Set up response capture — core_response_handler posts back to us
-    // The worker.js has this path: core_response_handler → postMessage({requestId, ...})
-    pending.set(reqId, {
-      resolve: (r) => { clearTimeout(timeout); resolve(r); },
-      reject:  (e) => { clearTimeout(timeout); reject(e); },
+    pendingReq.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v); },
+      reject:  (e) => { clearTimeout(timer); reject(e);  },
     });
 
-    workerOnMessage({
-      data: {
-        type: 'request',
-        context: ctx,
-        functionName,
-        functionParams: params,
-        requestId: reqId,
-      }
+    worker.postMessage({
+      type:           'request',
+      context:        sdkCtx,
+      requestId:      id,
+      functionName,
+      functionParams: typeof params === 'string' ? params : JSON.stringify(params),
     });
   });
 }
 
-// ── HTTP server ──────────────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
+// ── HTTP server ───────────────────────────────────────────────────────────────
+http.createServer(async (req, res) => {
+  const send = (obj) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(obj));
+  };
+
   if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200); res.end(JSON.stringify({ ok: true, ready: wasmReady }));
-    return;
+    return send({ ok: true, ready: ready && sdkCtx !== null });
   }
 
   if (req.method !== 'POST' || req.url !== '/call') {
-    res.writeHead(404); res.end('Not found');
-    return;
+    res.writeHead(404); return res.end('not found');
   }
 
   let body = '';
   req.on('data', d => body += d);
   req.on('end', async () => {
     try {
+      if (!ready || sdkCtx === null) throw new Error('TVM not ready');
       const { function: fn, params } = JSON.parse(body);
-      if (!wasmReady) throw new Error('WASM not ready yet');
-      const result = await callSdk(fn, params);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ result }));
+      const result = await sdkCall(fn, params);
+      send({ result });
     } catch (e) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: e.message }));
+      send({ error: e.message });
     }
   });
+
+}).listen(PORT, '127.0.0.1', () => {
+  console.log(`[tvm] listening on http://127.0.0.1:${PORT}`);
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log('[tvm] HTTP server on http://127.0.0.1:' + PORT);
-  initWorker().catch(e => { console.error('[tvm] Init failed:', e); process.exit(1); });
-});
+// ── Init ──────────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    console.log('[tvm] loading WASM + starting worker…');
+    await boot();
+
+    const cfg = JSON.stringify({
+      network: { endpoints: ['https://mainnet.ackinacki.org/graphql'] },
+    });
+    console.log('[tvm] creating SDK context…');
+    sdkCtx = await createCtx(cfg);
+    console.log('[tvm] ready. context =', sdkCtx);
+  } catch (e) {
+    console.error('[tvm] fatal:', e.message);
+    process.exit(1);
+  }
+})();
