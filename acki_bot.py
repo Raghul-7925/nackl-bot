@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
 """
-Acki Nacki Wallet Bot — uses tvmsdk.wasm via Node.js subprocess for TVM ops.
-
-Files needed in same directory:
-  acki_bot.py      ← this file
-  tvm_server.js    ← Node.js TVM wrapper
-  tvmsdk.wasm      ← Acki Nacki TVM SDK WASM (from acki.live)
-  worker.js        ← WASM glue JS (from acki.live)
-
-Install:
-  pip install httpx python-telegram-bot
-
-Run:
-  python acki_bot.py bot <TOKEN>
-  python acki_bot.py test <name_or_address>
+Acki Nacki Wallet Bot
+Uses bee_sdk.js (from miner app) via Node.js for address resolution.
+GraphQL queries mirror index.html exactly.
 """
-
-import asyncio, json, logging, os, re, subprocess, sys, threading, time
+import asyncio, json, logging, os, re, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 import httpx
@@ -24,70 +12,50 @@ import httpx
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════════════
-# CONSTANTS (from acki.live source)
-# ══════════════════════════════════════════════════════════════════════
+# ── Endpoints (from index.html CFG) ───────────────────────────────────────────
+GQL_ENDPOINTS = [
+    "https://mainnet.ackinacki.org/graphql",
+    "https://mainnet-cf.ackinacki.org/graphql",
+]
+GQL_HDR = {"Content-Type": "application/json", "Origin": "https://acki.live"}
 
-GRAPHQL   = "https://mainnet.ackinacki.org/graphql"
-GQL_HDR   = {"Content-Type": "text/plain", "Origin": "https://acki.live"}
-
-# Currency IDs — confirmed from chunk-F5RX2E5J.js: Hn={nackl:"1", usdc:"3"}
-NACKL_ID  = 1   # in balance_other
-USDC_ID   = 3   # in balance_other
+# Currency IDs confirmed from index.html (cur1 = currency 1 = NACKL locked)
+NACKL_ID  = 1
+USDC_ID   = 3
 NACKL_DEC = 9
 USDC_DEC  = 6
-SHELL_DEC = 9   # native balance field
+SHELL_DEC = 9
 
-# ABIs extracted from chunk-F5RX2E5J.js
-INDEXER_ABI = {"ABI version":2,"version":"2.4","header":["pubkey","time","expire"],"functions":[{"name":"getDetails","inputs":[],"outputs":[{"name":"name","type":"string"},{"name":"wallet","type":"address"}]},{"name":"getVersion","inputs":[],"outputs":[{"name":"value0","type":"string"},{"name":"value1","type":"string"}]}],"events":[],"fields":[{"init":True,"name":"_pubkey","type":"uint256"},{"init":False,"name":"_timestamp","type":"uint64"},{"init":False,"name":"_constructorFlag","type":"bool"},{"init":True,"name":"_name","type":"string"},{"init":False,"name":"_wallet","type":"address"},{"init":False,"name":"_root","type":"address"},{"init":False,"name":"_rootPubkey","type":"uint256"}]}
+# dapp_id used for PopitGame locked balance query (from index.html queryCurrency1Balance)
+POPIT_DAPP_ID = "0000000000000000000000000000000000000000000000000000000000000001"
 
-POPIT_ABI = {"ABI version":2,"version":"2.4","header":["pubkey","time","expire"],"functions":[{"name":"getDetails","inputs":[],"outputs":[{"name":"owner","type":"address"},{"name":"root","type":"address"},{"name":"startTime","type":"uint32"},{"name":"mbiCur","type":"uint64"},{"name":"boost","type":"address"},{"name":"rewards","type":"uint128"},{"name":"minstake","type":"uint128"}]},{"name":"getVersion","inputs":[],"outputs":[{"name":"value0","type":"string"},{"name":"value1","type":"string"}]}],"events":[],"fields":[{"init":True,"name":"_pubkey","type":"uint256"},{"init":False,"name":"_timestamp","type":"uint64"},{"init":False,"name":"_constructorFlag","type":"bool"},{"init":False,"name":"_code","type":"map(uint8,cell)"},{"init":True,"name":"_owner","type":"address"},{"init":False,"name":"_mbiCur","type":"uint64"},{"init":False,"name":"_root","type":"address"},{"init":False,"name":"_startTime","type":"uint32"},{"init":False,"name":"_root_pubkey","type":"uint256"},{"init":False,"name":"_boost","type":"address"},{"init":False,"name":"_rewards","type":"uint128"}]}
-
-# TVC codes (base64) from chunk-F5RX2E5J.js (Un = PopitGame, Wn = Indexer)
-INDEXER_TVC = "te6ccgECIwEABTUABCSK7VMg4wMgwP/jAiDA/uMC8gseAwEiArSNCGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAT4aSHbPNMAAY4igwjXGCD4KMjOzsn5AAHTAAGU0/9QM5MC+ELiIPhl+RDyqJXTAAHyeuLTPwEcAgFO+EMhufK0IPgjgQPoqIIg94rA3o6A3vgAkvAOlIAg94pA3rOl99CTVM52+A/SaG1g+kAx0NMDAcchkl8E4AHTPwHtRNDXCx+DFv79wT/4PfpA1NHQ0wfU0dDTB9Mf0//TD9P/0wf0BPQF+Gj4Z/hm+GP4Yo6A2CL4SfhKxwXy4+j4ACT4SoBA9A6OgN/4RvJzcfhm4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4uIw0x8B+CO88rki+E/A/5Jt"
-
-POPIT_TVC   = "te6ccgECPAEACZQABCSK7VMg4wMgwP/jAiDA/uMC8gs3AwE7ArSNCGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAT4aSHbPNMAAY4igwjXGCD4KMjOzsn5AAHTAAGU0/9QM5MC+ELiIPhl+RDyqJXTAAHyeuLTPwE2AgFO+EMhufK0IPgjgQPoqIIg94rA3o6A3vgAkvAOlIAg94pA3rOl99CTVM52+A/SaG1g+kAx0NMDAcchkl8E4AHTPwHtRNDXCx+DFv79wT/4PfpA1NHQ0wfU0dDTB9Mf0//TD9P/0wf0BPQF+Gj4Z/hm+GP4Yo6A2CL4SfhKxwXy4+j4ACT4SoBA9A6OgN/4RvJzcfhm4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4tMAAY4SgQIA1xgg+QFY+EIg2zxY2zHikvIz4uIw0x8B+CO88rki+E/A/5JtXw3xwAKSbV8N4iCUMCDTHwHbMeBb2zxb"
-
-# ══════════════════════════════════════════════════════════════════════
-# TVM server (Node.js subprocess)
-# ══════════════════════════════════════════════════════════════════════
-
-TVM_PORT    = int(os.environ.get("TVM_PORT", "7799"))
-TVM_BASE    = f"http://127.0.0.1:{TVM_PORT}"
-_tvm_proc   = None
+# ── TVM server ─────────────────────────────────────────────────────────────────
+TVM_PORT  = int(os.environ.get("TVM_PORT", "7799"))
+TVM_BASE  = f"http://127.0.0.1:{TVM_PORT}"
+_tvm_proc = None
 
 def start_tvm_server():
-    """Launch tvm_server.js as a subprocess."""
     global _tvm_proc
     script = os.path.join(os.path.dirname(__file__), "tvm_server.js")
     if not os.path.exists(script):
-        log.warning("tvm_server.js not found — TVM features disabled")
-        return False
-
-    node = "node"
+        log.warning("tvm_server.js not found")
+        return
     try:
         env = os.environ.copy()
         env["TVM_PORT"] = str(TVM_PORT)
         _tvm_proc = subprocess.Popen(
-            [node, script],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            ["node", script], env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
-        # Log output in background thread
         def _pipe():
             for line in _tvm_proc.stdout:
                 log.info("[node] %s", line.decode().rstrip())
         threading.Thread(target=_pipe, daemon=True).start()
         log.info("TVM server started (pid %d)", _tvm_proc.pid)
-        return True
     except FileNotFoundError:
-        log.warning("Node.js not found — TVM features disabled")
-        return False
+        log.warning("node not found — TVM features disabled")
 
-
-async def wait_tvm_ready(timeout: int = 30):
-    """Wait until the TVM server responds to /health."""
+async def wait_tvm_ready(timeout=30):
     deadline = time.time() + timeout
     async with httpx.AsyncClient() as c:
         while time.time() < deadline:
@@ -98,13 +66,11 @@ async def wait_tvm_ready(timeout: int = 30):
                     return True
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-    log.warning("TVM server did not become ready in %ds", timeout)
+            await asyncio.sleep(1)
+    log.warning("TVM server not ready after %ds", timeout)
     return False
 
-
 async def tvm_call(action: str, name: str) -> Optional[str]:
-    """Call bee_sdk via the Node.js TVM server."""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(
@@ -115,256 +81,208 @@ async def tvm_call(action: str, name: str) -> Optional[str]:
             )
         body = r.json()
         if "error" in body:
-            log.warning("tvm_call(%s, %s) error: %s", action, name, body["error"])
+            log.warning("tvm_call %s(%s): %s", action, name, body["error"])
             return None
         return body.get("result")
     except Exception as e:
-        log.warning("tvm_call(%s, %s) failed: %s", action, name, e)
+        log.warning("tvm_call %s(%s) failed: %s", action, name, e)
         return None
 
+# ── GraphQL ────────────────────────────────────────────────────────────────────
 
-async def tvm_get_wallet_address(name: str) -> Optional[str]:
-    """Resolve wallet name → MvMultifactor address using bee_sdk."""
-    result = await tvm_call("wallet_address", name)
-    if result:
-        return hex_id(result)
-    return None
+async def gql(client: httpx.AsyncClient, query: str) -> dict:
+    """Try each endpoint until one succeeds."""
+    for url in GQL_ENDPOINTS:
+        try:
+            r = await client.post(
+                url,
+                content=json.dumps({"query": query}),
+                headers=GQL_HDR, timeout=15,
+            )
+            body = r.json()
+            if "errors" not in body and body.get("data"):
+                return body["data"]
+        except Exception:
+            continue
+    return {}
 
+async def fetch_account(client: httpx.AsyncClient, account_id: str, dapp_id: str = None) -> Optional[dict]:
+    """Fetch account info. dapp_id defaults to account_id."""
+    did = dapp_id or account_id
+    q = f"""{{blockchain{{account(account_id:"{account_id}" dapp_id:"{did}"){{
+      info{{
+        balance
+        balance_other{{currency value}}
+        code_hash last_trans_lt last_paid
+      }}
+    }}}}}}"""
+    data = await gql(client, q)
+    return data.get("blockchain", {}).get("account", {}).get("info")
 
-async def tvm_get_popit_address(name: str) -> Optional[str]:
-    """Resolve wallet name → PopitGame address using bee_sdk."""
-    result = await tvm_call("popit_address", name)
-    if result:
-        return hex_id(result)
-    return None
+async def fetch_transactions(client: httpx.AsyncClient, account_id: str, limit=100) -> list:
+    q = f"""{{blockchain{{account(account_id:"{account_id}" dapp_id:"{account_id}"){{
+      transactions(last:{limit} allow_latest_inconsistent_data:true){{
+        nodes{{now balance_delta_other{{currency value}}}}
+      }}
+    }}}}}}"""
+    data = await gql(client, q)
+    return (data.get("blockchain",{}).get("account",{})
+                .get("transactions",{}).get("nodes",[])) or []
 
-# ══════════════════════════════════════════════════════════════════════
-# GraphQL helpers
-# ══════════════════════════════════════════════════════════════════════
-
-async def gql(client: httpx.AsyncClient, query: str, variables: dict) -> dict:
-    r = await client.post(
-        GRAPHQL,
-        content=json.dumps({"query": query, "variables": variables}),
-        headers=GQL_HDR, timeout=20,
-    )
-    r.raise_for_status()
-    body = r.json()
-    if "errors" in body:
-        raise ValueError(body["errors"][0]["message"])
-    return body.get("data", {})
-
-Q_ACCOUNT = """
-query GetAccount($a: String!, $d: String!) {
-  blockchain {
-    account(account_id: $a, dapp_id: $d) {
-      info {
-        balance(format: DEC)
-        balance_other { currency  value(format: DEC) }
-        code_hash  init_code_hash
-        last_paid  last_trans_lt(format: DEC)
-        data       dapp_id
-      }
-    }
-  }
-}"""
-
-Q_TXNS = """
-query GetTxns($a: String!, $d: String!, $n: Int!) {
-  blockchain {
-    account(account_id: $a, dapp_id: $d) {
-      transactions(last: $n, allow_latest_inconsistent_data: true) {
-        nodes {
-          now
-          balance_delta_other { currency  value(format: DEC) }
-        }
-      }
-    }
-  }
-}"""
-
-async def fetch_info(client: httpx.AsyncClient, aid: str) -> Optional[dict]:
-    try:
-        d = await gql(client, Q_ACCOUNT, {"a": aid, "d": aid})
-        return d.get("blockchain", {}).get("account", {}).get("info")
-    except Exception as e:
-        log.warning("fetch_info(%s): %s", aid, e)
-        return None
-
-# ══════════════════════════════════════════════════════════════════════
-# Utilities
-# ══════════════════════════════════════════════════════════════════════
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def is_addr(s: str) -> bool:
-    s = s.strip()
-    return bool(re.match(r'^-?\d+:[a-fA-F0-9]{64}$', s)
-             or re.match(r'^[a-fA-F0-9]{64}$', s))
+    return bool(re.match(r'^-?\d+:[a-fA-F0-9]{64}$', s.strip())
+             or re.match(r'^[a-fA-F0-9]{64}$', s.strip()))
 
 def hex_id(addr: str) -> str:
     m = re.match(r'^-?\d+:([a-fA-F0-9]{64})$', addr.strip())
     return m.group(1).lower() if m else addr.strip().lower()
 
-def fmt(raw, dec=9, show=2):
-    if not raw or str(raw) == "0":
-        return f"0.{'0'*show}"
+def parse_balance_hex(val: str, decimals: int = 9) -> float:
+    """Parse hex OR decimal balance string → float. Mirrors index.html exactly."""
+    if not val or val == "0":
+        return 0.0
     try:
-        n = int(raw)
-        w = n // 10**dec
-        f = str(n % 10**dec).zfill(dec)[:show]
-        return f"{w:,}.{f}"
+        if isinstance(val, str) and val.startswith("0x"):
+            raw = int(val, 16)
+        elif isinstance(val, str) and re.match(r'^[0-9a-fA-F]+$', val) and not val.isdigit():
+            raw = int(val, 16)  # hex without 0x prefix
+        else:
+            raw = int(val)      # decimal
+        return raw / (10 ** decimals)
     except Exception:
-        return f"0.{'0'*show}"
+        return 0.0
 
-# ══════════════════════════════════════════════════════════════════════
-# Wallet lookup
-# ══════════════════════════════════════════════════════════════════════
+def fmt(val: float, decimals: int = 2) -> str:
+    if val == 0:
+        return "0.00"
+    if val >= 1000:
+        return f"{val:,.{decimals}f}"
+    return f"{val:.{decimals}f}"
+
+# ── Wallet lookup ──────────────────────────────────────────────────────────────
 
 async def lookup_wallet(identifier: str) -> dict:
     identifier = identifier.strip()
 
     async with httpx.AsyncClient() as http:
 
-        # ── 1. Resolve name → MvMultifactor hex ID ───────────────────────────
+        # ── 1. Resolve name → MvMultifactor address ───────────────────────────
         wallet_name: Optional[str] = None
         mv_id: Optional[str]       = None
 
         if is_addr(identifier):
             mv_id = hex_id(identifier)
         else:
-            wallet_name = identifier
-            name_lower  = identifier.lower()
+            wallet_name = identifier.lower()
+            # Use bee_sdk to get wallet address (mirrors index.html connectWallet)
+            addr_str = await tvm_call("wallet_address", wallet_name)
+            log.info("bee_sdk wallet_address(%s) = %s", wallet_name, addr_str)
 
-            # bee_sdk: resolve name → MvMultifactor address directly
-            mv_addr = await tvm_get_wallet_address(name_lower)
-            log.info("Wallet address for '%s': %s", name_lower, mv_addr)
-            if mv_addr:
-                mv_id = mv_addr
+            if addr_str and addr_str != "None":
+                mv_id = hex_id(addr_str)
+            else:
+                raise ValueError(
+                    f"Wallet *'{identifier}'* not found.\n"
+                    "Try the full address:\n`/wallet 0:8c478bed...`"
+                )
 
-            if not mv_id:
-                # Fallback: try name as account_id directly
-                info_direct = await fetch_info(http, name_lower)
-                if info_direct and info_direct.get("code_hash"):
-                    mv_id = name_lower
-                else:
-                    raise ValueError(
-                        f"Wallet *'{identifier}'* not found.\n"
-                        "Try the full address:\n"
-                        "`/wallet 0:8c478bed...`"
-                    )
-
-        # ── 2. Fetch MvMultifactor info ───────────────────────────────────────
-        mv_info = await fetch_info(http, mv_id)
+        # ── 2. Fetch MvMultifactor account ────────────────────────────────────
+        mv_info = await fetch_account(http, mv_id)
         if not mv_info:
             raise ValueError(f"Account `0:{mv_id}` not found on chain.")
 
-        # ── 3. Balances ───────────────────────────────────────────────────────
-        shell_raw = mv_info.get("balance", "0") or "0"
-        nackl_raw = "0"
-        usdc_raw  = "0"
+        # ── 3. Parse balances exactly as index.html does ──────────────────────
+        # SHELL = native balance (hex string)
+        shell_val = parse_balance_hex(mv_info.get("balance", "0") or "0", SHELL_DEC)
+
+        # balance_other: currency=1 is NACKL, currency=3 is USDC
+        nackl_val = 0.0
+        usdc_val  = 0.0
         for b in mv_info.get("balance_other") or []:
             cid = b.get("currency", -1)
-            val = b.get("value", "0") or "0"
-            if cid == NACKL_ID: nackl_raw = val
-            elif cid == USDC_ID: usdc_raw = val
+            v   = parse_balance_hex(b.get("value", "0") or "0", NACKL_DEC)
+            if cid == NACKL_ID:   nackl_val = v
+            elif cid == USDC_ID:  usdc_val  = v
 
-        # ── 4. PopitGame ──────────────────────────────────────────────────────
-        popit_id    = await tvm_get_popit_address(wallet_name.lower() if wallet_name else mv_id)
-        log.info("PopitGame addr: %s", popit_id)
-
-        locked_raw  = "0"
+        # ── 4. Get PopitGame address via bee_sdk ──────────────────────────────
+        locked_val  = 0.0
         mbi_level   = 0
         popit_speed = 0.0
         popit_found = False
 
-        if popit_id:
-            popit_info = await fetch_info(http, popit_id)
+        if wallet_name:
+            popit_str = await tvm_call("popit_address", wallet_name)
+            log.info("bee_sdk popit_address(%s) = %s", wallet_name, popit_str)
+        else:
+            popit_str = None
+
+        if popit_str and popit_str != "None":
+            popit_hex = hex_id(popit_str)
+            popit_found = True
+
+            # Query locked NACKL exactly as index.html queryCurrency1Balance does:
+            # Uses dapp_id = "0000...0001" NOT the popit address itself
+            popit_info = await fetch_account(http, popit_hex, POPIT_DAPP_ID)
             if popit_info:
-                popit_found = True
                 for b in popit_info.get("balance_other") or []:
                     if b.get("currency") == NACKL_ID:
-                        locked_raw = b.get("value", "0") or "0"
+                        locked_val = parse_balance_hex(b.get("value","0") or "0", NACKL_DEC)
 
-                if popit_info.get("data"):
-                    dp = await tvm_decode_popit_data(popit_info["data"])
-                    log.info("PopitGame decoded: %s", dp)
-                    if dp:
-                        mbi_level = int(dp.get("_mbiCur", 0) or 0)
-                        try:
-                            rewards   = int(dp.get("_rewards", "0") or "0")
-                            start_ts  = int(dp.get("_startTime", "0") or "0")
-                            elapsed   = int(time.time()) - start_ts
-                            if elapsed > 0 and rewards > 0:
-                                popit_speed = (rewards / 10**NACKL_DEC) * (86400 / elapsed)
-                        except (ValueError, TypeError):
-                            pass
-
-        # ── 5. Transactions → speed + tap count ──────────────────────────────
+        # ── 5. Transactions: speed + taps ─────────────────────────────────────
         tx_speed = 0.0
         taps     = 0
         try:
-            d = await gql(http, Q_TXNS, {"a": mv_id, "d": mv_id, "n": 100})
-            nodes = (d.get("blockchain",{})
-                      .get("account",{})
-                      .get("transactions",{})
-                      .get("nodes",[]))
-            if nodes:
-                now_ts = max(t.get("now", 0) for t in nodes)
-                cutoff = now_ts - 86400
-                earned = 0
-                for tx in nodes:
+            txns = await fetch_transactions(http, mv_id, limit=100)
+            if txns:
+                now_ts  = max((t.get("now", 0) for t in txns), default=0)
+                cutoff  = now_ts - 86400
+                earned  = 0.0
+                for tx in txns:
                     ts = tx.get("now", 0)
-                    for delta in tx.get("balance_delta_other") or []:
-                        if delta.get("currency") == NACKL_ID:
-                            try:
-                                v = int(delta.get("value", "0"))
-                                if v > 0:
-                                    if ts >= cutoff: earned += v
-                                    taps += 1
-                                    break
-                            except (ValueError, TypeError):
-                                pass
-                wh = (now_ts - cutoff) / 3600 if now_ts > cutoff else 24
-                tx_speed = (earned / 10**NACKL_DEC) * (24 / max(wh, 0.1))
+                    for d in tx.get("balance_delta_other") or []:
+                        if d.get("currency") == NACKL_ID:
+                            v = parse_balance_hex(d.get("value","0") or "0", NACKL_DEC)
+                            if v > 0:
+                                if ts >= cutoff:
+                                    earned += v
+                                taps += 1
+                                break
+                window_h = (now_ts - cutoff) / 3600 if now_ts > cutoff else 24
+                tx_speed = earned * (24 / max(window_h, 0.1))
         except Exception as e:
             log.warning("tx stats: %s", e)
 
-        speed = popit_speed if popit_speed > 0 else tx_speed
-
         return {
-            "name":        wallet_name or f"0:{mv_id}",
-            "address":     f"0:{mv_id}",
-            "nackl":       nackl_raw,
-            "locked":      locked_raw,
-            "usdc":        usdc_raw,
-            "shell":       shell_raw,
-            "speed":       speed,
-            "taps":        taps,
-            "mbi":         mbi_level,
-            "popit_found": popit_found,
+            "name":    wallet_name or f"0:{mv_id[:8]}...",
+            "address": f"0:{mv_id}",
+            "nackl":   nackl_val,
+            "locked":  locked_val,
+            "usdc":    usdc_val,
+            "shell":   shell_val,
+            "speed":   tx_speed,
+            "taps":    taps,
+            "mbi":     mbi_level,
         }
 
-# ══════════════════════════════════════════════════════════════════════
-# Formatter
-# ══════════════════════════════════════════════════════════════════════
+# ── Format ─────────────────────────────────────────────────────────────────────
 
 def format_msg(w: dict) -> str:
     return "\n".join([
         "📊 *Wallet Info*\n",
         f"👤 {w['name']}",
-        f"🪙 NACKL: `{fmt(w['nackl'], NACKL_DEC)}`",
-        f"🔒 Locked: `{fmt(w['locked'], NACKL_DEC)}`",
-        f"💵 USDC: `{fmt(w['usdc'], USDC_DEC)}`",
-        f"🐚 SHELL: `{fmt(w['shell'], SHELL_DEC)}`",
-        f"⚡ Speed: `{w['speed']:,.2f} NACKL/24h`",
+        f"🪙 NACKL: `{fmt(w['nackl'])}`",
+        f"🔒 Locked: `{fmt(w['locked'])}`",
+        f"💵 USDC: `{fmt(w['usdc'])}`",
+        f"🐚 SHELL: `{fmt(w['shell'], 4)}`",
+        f"⚡ Speed: `{fmt(w['speed'])} NACKL/24h`",
         f"👆 Total taps: `{w['taps']}`",
         f"🎮 MBI Level: `{w['mbi']}`",
         f"\n📍 `{w['address']}`",
     ])
 
-# ══════════════════════════════════════════════════════════════════════
-# Telegram bot
-# ══════════════════════════════════════════════════════════════════════
-
+# ── Telegram bot ───────────────────────────────────────────────────────────────
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -391,10 +309,10 @@ async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError as e:
         await msg.edit_text(f"❌ {e}", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        log.exception("lookup_wallet error")
+        log.exception("lookup error")
         await msg.edit_text(f"❌ Error: {e}")
 
-# ── Health server (Render) ────────────────────────────────────────────────────
+# ── Health server ──────────────────────────────────────────────────────────────
 class _H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
@@ -403,18 +321,13 @@ class _H(BaseHTTPRequestHandler):
 def _health():
     HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), _H).serve_forever()
 
-# ══════════════════════════════════════════════════════════════════════
-# Entry point
-# ══════════════════════════════════════════════════════════════════════
+# ── Entry ──────────────────────────────────────────────────────────────────────
 
 def run_bot(token: str):
     threading.Thread(target=_health, daemon=True).start()
     start_tvm_server()
-    # Give Node.js 10s to start before first request; it'll keep warming in bg
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(asyncio.sleep(3))
-    loop.close()
-
+    # Wait for Node.js TVM server to be ready
+    asyncio.get_event_loop().run_until_complete(wait_tvm_ready(30))
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
@@ -424,19 +337,18 @@ def run_bot(token: str):
 
 async def _test(q: str):
     start_tvm_server()
-    await asyncio.sleep(3)   # wait for Node.js
-    await wait_tvm_ready(20)
+    await wait_tvm_ready(30)
     print(f"\nLooking up: {q}\n")
     try:
         w = await lookup_wallet(q)
         print(format_msg(w).replace("*","").replace("`",""))
-        print("\npopit_found:", w["popit_found"])
     except ValueError as e:
         print(f"Error: {e}")
     except Exception:
         import traceback; traceback.print_exc()
 
 if __name__ == "__main__":
+    import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode == "bot":
         token = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("TELEGRAM_TOKEN","")

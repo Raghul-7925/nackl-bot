@@ -1,0 +1,9 @@
+{
+  "name": "acki-wallet-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Acki Nacki Telegram Wallet Bot",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
