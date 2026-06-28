@@ -103,80 +103,40 @@ async def wait_tvm_ready(timeout: int = 30):
     return False
 
 
-async def tvm_call(function_name: str, params: dict) -> Optional[dict]:
-    """Call a function on the TVM SDK server."""
+async def tvm_call(action: str, name: str) -> Optional[str]:
+    """Call bee_sdk via the Node.js TVM server."""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(
-                f"{TVM_BASE}/call",
-                content=json.dumps({"function": function_name, "params": params}),
+                f"{TVM_BASE}/",
+                content=json.dumps({"action": action, "name": name}),
                 headers={"Content-Type": "application/json"},
-                timeout=15,
+                timeout=20,
             )
         body = r.json()
         if "error" in body:
-            log.warning("tvm_call(%s) error: %s", function_name, body["error"])
+            log.warning("tvm_call(%s, %s) error: %s", action, name, body["error"])
             return None
         return body.get("result")
     except Exception as e:
-        log.warning("tvm_call(%s) failed: %s", function_name, e)
+        log.warning("tvm_call(%s, %s) failed: %s", action, name, e)
         return None
 
 
-async def tvm_get_indexer_address(name: str) -> Optional[str]:
-    """
-    Derive Indexer contract address from wallet name.
-    = encode_message(IndexerABI, tvc=INDEXER_TVC, initial_data={_pubkey:"0x0", _name:name})
-    """
-    result = await tvm_call("abi.encode_message", {
-        "abi": {"type": "Json", "value": json.dumps(INDEXER_ABI)},
-        "deploy_set": {
-            "tvc": INDEXER_TVC,
-            "initial_data": {"_pubkey": "0x0", "_name": name.lower()},
-        },
-        "signer": {"type": "None"},
-    })
-    if result and result.get("address"):
-        addr = result["address"]
-        return addr.split(":")[-1].lower()
+async def tvm_get_wallet_address(name: str) -> Optional[str]:
+    """Resolve wallet name → MvMultifactor address using bee_sdk."""
+    result = await tvm_call("wallet_address", name)
+    if result:
+        return hex_id(result)
     return None
 
 
-async def tvm_get_popit_address(mv_hex_id: str) -> Optional[str]:
-    """
-    Derive PopitGame contract address from MvMultifactor address.
-    = encode_message(PopitGameABI, tvc=POPIT_TVC, initial_data={_pubkey:"0x0", _owner:"0:mv"})
-    """
-    result = await tvm_call("abi.encode_message", {
-        "abi": {"type": "Json", "value": json.dumps(POPIT_ABI)},
-        "deploy_set": {
-            "tvc": POPIT_TVC,
-            "initial_data": {"_pubkey": "0x0", "_owner": f"0:{mv_hex_id}"},
-        },
-        "signer": {"type": "None"},
-    })
-    if result and result.get("address"):
-        addr = result["address"]
-        return addr.split(":")[-1].lower()
+async def tvm_get_popit_address(name: str) -> Optional[str]:
+    """Resolve wallet name → PopitGame address using bee_sdk."""
+    result = await tvm_call("popit_address", name)
+    if result:
+        return hex_id(result)
     return None
-
-
-async def tvm_decode_indexer_data(data_boc: str) -> Optional[dict]:
-    """Decode Indexer data BOC → {_name, _wallet, ...}"""
-    result = await tvm_call("abi.decode_account_data", {
-        "abi": {"type": "Json", "value": json.dumps(INDEXER_ABI)},
-        "data": data_boc,
-    })
-    return result.get("data") if result else None
-
-
-async def tvm_decode_popit_data(data_boc: str) -> Optional[dict]:
-    """Decode PopitGame data BOC → {_mbiCur, _rewards, _startTime, ...}"""
-    result = await tvm_call("abi.decode_account_data", {
-        "abi": {"type": "Json", "value": json.dumps(POPIT_ABI)},
-        "data": data_boc,
-    })
-    return result.get("data") if result else None
 
 # ══════════════════════════════════════════════════════════════════════
 # GraphQL helpers
@@ -274,20 +234,11 @@ async def lookup_wallet(identifier: str) -> dict:
             wallet_name = identifier
             name_lower  = identifier.lower()
 
-            # TVM: derive Indexer address from name
-            indexer_id = await tvm_get_indexer_address(name_lower)
-            log.info("Indexer addr for '%s': %s", name_lower, indexer_id)
-
-            if indexer_id:
-                idxr_info = await fetch_info(http, indexer_id)
-                if idxr_info and idxr_info.get("data"):
-                    decoded = await tvm_decode_indexer_data(idxr_info["data"])
-                    log.info("Indexer decoded: %s", decoded)
-                    if decoded:
-                        wallet_name = decoded.get("_name") or wallet_name
-                        w = decoded.get("_wallet", "")
-                        if w:
-                            mv_id = hex_id(w)
+            # bee_sdk: resolve name → MvMultifactor address directly
+            mv_addr = await tvm_get_wallet_address(name_lower)
+            log.info("Wallet address for '%s': %s", name_lower, mv_addr)
+            if mv_addr:
+                mv_id = mv_addr
 
             if not mv_id:
                 # Fallback: try name as account_id directly
@@ -317,7 +268,7 @@ async def lookup_wallet(identifier: str) -> dict:
             elif cid == USDC_ID: usdc_raw = val
 
         # ── 4. PopitGame ──────────────────────────────────────────────────────
-        popit_id    = await tvm_get_popit_address(mv_id)
+        popit_id    = await tvm_get_popit_address(wallet_name.lower() if wallet_name else mv_id)
         log.info("PopitGame addr: %s", popit_id)
 
         locked_raw  = "0"
