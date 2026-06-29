@@ -1,13 +1,9 @@
 /**
  * tvm_server.js — Acki Nacki address resolver using bee_sdk
+ * Exact params from index.html (NJDminers miner app)
  *
- * Exact param format from index.html:
- *   bee.get_wallet_address_by_wallet_name({
- *     client_config: { network: { endpoints: [...] } },
- *     wallet_name: name
- *   })
- *
- * Files needed: bee_sdk.js, bee_sdk_bg.wasm (+ package.json with "type":"module")
+ * Files needed: bee_sdk.js, bee_sdk_bg.wasm, package.json (type:module)
+ * Run: node tvm_server.js
  */
 
 import { readFileSync } from 'fs';
@@ -24,24 +20,22 @@ import beeSdkInit, {
 const __dir = dirname(fileURLToPath(import.meta.url));
 const PORT  = parseInt(process.env.TVM_PORT || '7799', 10);
 
-// Endpoints WITHOUT /graphql (as used in index.html goshEndpoints)
-const ENDPOINTS = [
+// Exact endpoints from index.html CFG.goshEndpoints (NO /graphql)
+const GOSH_ENDPOINTS = [
   'https://mainnet.ackinacki.org',
   'https://mainnet-cf.ackinacki.org',
 ];
 
-const CLIENT_CONFIG = { network: { endpoints: ENDPOINTS } };
+// Exact param structure from index.html
+const CLIENT_CONFIG = { network: { endpoints: GOSH_ENDPOINTS } };
 
-// ── Init WASM ─────────────────────────────────────────────────────────────────
 let ready = false;
 
+// ── Init WASM ─────────────────────────────────────────────────────────────────
 async function initWasm() {
-  const wasmBytes = readFileSync(join(__dir, 'bee_sdk_bg.wasm'));
-  const wasmBuf   = wasmBytes.buffer.slice(
-    wasmBytes.byteOffset,
-    wasmBytes.byteOffset + wasmBytes.byteLength
-  );
-  await beeSdkInit({ module_or_path: wasmBuf });
+  const bytes = readFileSync(join(__dir, 'bee_sdk_bg.wasm'));
+  const buf   = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  await beeSdkInit({ module_or_path: buf });
   console.log('[tvm] bee_sdk WASM ready');
   ready = true;
 }
@@ -67,6 +61,8 @@ createServer(async (req, res) => {
     try {
       if (!ready) throw new Error('WASM not ready');
       const { action, name } = JSON.parse(body);
+
+      // Exact params from index.html
       const params = { client_config: CLIENT_CONFIG, wallet_name: name };
       let result;
 
@@ -84,10 +80,10 @@ createServer(async (req, res) => {
           throw new Error('Unknown action: ' + action);
       }
 
-      console.log(`[tvm] ${action}(${name}) =`, result);
+      console.log(`[tvm] ${action}(${name}) = ${result}`);
       send({ result: String(result) });
     } catch (e) {
-      console.error(`[tvm] error:`, e.message);
+      console.error(`[tvm] ${e.message}`);
       send({ error: e.message });
     }
   });

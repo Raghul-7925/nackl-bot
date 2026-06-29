@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
 """
-Acki Nacki Wallet Bot
-Uses bee_sdk.js (from miner app) via Node.js for address resolution.
-GraphQL queries mirror index.html exactly.
+Acki Nacki Wallet Bot — mirrors NJDminers index.html exactly.
+
+Data sources:
+  - bee_sdk (via tvm_server.js Node.js):
+      get_wallet_address_by_wallet_name   → MvMultifactor address
+      get_popitgame_address_by_wallet_name → PopitGame address
+  - GraphQL (mainnet.ackinacki.org/graphql):
+      MvMultifactor: balance (SHELL), balance_other (NACKL id=1, USDC id=3)
+      PopitGame:     balance_other with dapp_id=0000...0001 → locked NACKL
+      Transactions:  balance_delta_other → speed + taps
 """
+
 import asyncio, json, logging, os, re, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
@@ -12,33 +20,30 @@ import httpx
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Endpoints (from index.html CFG) ───────────────────────────────────────────
+# ── Config (mirrors index.html CFG) ───────────────────────────────────────────
 GQL_ENDPOINTS = [
     "https://mainnet.ackinacki.org/graphql",
     "https://mainnet-cf.ackinacki.org/graphql",
 ]
-GQL_HDR = {"Content-Type": "application/json", "Origin": "https://acki.live"}
+GQL_HDR = {"Content-Type": "application/json"}
 
-# Currency IDs confirmed from index.html (cur1 = currency 1 = NACKL locked)
+# Currency IDs (from index.html: cur.currency == 1 is NACKL locked)
 NACKL_ID  = 1
 USDC_ID   = 3
-NACKL_DEC = 9
-USDC_DEC  = 6
-SHELL_DEC = 9
 
-# dapp_id used for PopitGame locked balance query (from index.html queryCurrency1Balance)
+# dapp_id for PopitGame locked balance query (from index.html queryCurrency1Balance)
 POPIT_DAPP_ID = "0000000000000000000000000000000000000000000000000000000000000001"
 
-# ── TVM server ─────────────────────────────────────────────────────────────────
+# ── TVM server (Node.js subprocess) ───────────────────────────────────────────
 TVM_PORT  = int(os.environ.get("TVM_PORT", "7799"))
 TVM_BASE  = f"http://127.0.0.1:{TVM_PORT}"
 _tvm_proc = None
 
 def start_tvm_server():
     global _tvm_proc
-    script = os.path.join(os.path.dirname(__file__), "tvm_server.js")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tvm_server.js")
     if not os.path.exists(script):
-        log.warning("tvm_server.js not found")
+        log.warning("tvm_server.js not found — name lookups disabled")
         return
     try:
         env = os.environ.copy()
@@ -53,7 +58,7 @@ def start_tvm_server():
         threading.Thread(target=_pipe, daemon=True).start()
         log.info("TVM server started (pid %d)", _tvm_proc.pid)
     except FileNotFoundError:
-        log.warning("node not found — TVM features disabled")
+        log.warning("node not found — name lookups disabled")
 
 async def wait_tvm_ready(timeout=30):
     deadline = time.time() + timeout
@@ -67,99 +72,120 @@ async def wait_tvm_ready(timeout=30):
             except Exception:
                 pass
             await asyncio.sleep(1)
-    log.warning("TVM server not ready after %ds", timeout)
+    log.warning("TVM server not ready after %ds — name lookups may fail", timeout)
     return False
 
 async def tvm_call(action: str, name: str) -> Optional[str]:
+    """Call bee_sdk via Node.js TVM server."""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(
                 f"{TVM_BASE}/",
                 content=json.dumps({"action": action, "name": name}),
                 headers={"Content-Type": "application/json"},
-                timeout=20,
+                timeout=25,
             )
         body = r.json()
         if "error" in body:
-            log.warning("tvm_call %s(%s): %s", action, name, body["error"])
+            log.warning("tvm %s(%s): %s", action, name, body["error"])
             return None
-        return body.get("result")
+        result = body.get("result", "")
+        return result if result and result != "None" else None
     except Exception as e:
-        log.warning("tvm_call %s(%s) failed: %s", action, name, e)
+        log.warning("tvm %s(%s) failed: %s", action, name, e)
         return None
 
-# ── GraphQL ────────────────────────────────────────────────────────────────────
-
+# ── GraphQL helper (mirrors index.html gql()) ─────────────────────────────────
 async def gql(client: httpx.AsyncClient, query: str) -> dict:
-    """Try each endpoint until one succeeds."""
+    """Try each endpoint until one returns data."""
     for url in GQL_ENDPOINTS:
         try:
             r = await client.post(
                 url,
                 content=json.dumps({"query": query}),
-                headers=GQL_HDR, timeout=15,
+                headers=GQL_HDR, timeout=12,
             )
-            body = r.json()
-            if "errors" not in body and body.get("data"):
-                return body["data"]
+            j = r.json()
+            if j.get("data"):
+                return j["data"]
         except Exception:
             continue
     return {}
 
-async def fetch_account(client: httpx.AsyncClient, account_id: str, dapp_id: str = None) -> Optional[dict]:
-    """Fetch account info. dapp_id defaults to account_id."""
-    did = dapp_id or account_id
-    q = f"""{{blockchain{{account(account_id:"{account_id}" dapp_id:"{did}"){{
-      info{{
-        balance
-        balance_other{{currency value}}
-        code_hash last_trans_lt last_paid
-      }}
-    }}}}}}"""
-    data = await gql(client, q)
-    return data.get("blockchain", {}).get("account", {}).get("info")
-
-async def fetch_transactions(client: httpx.AsyncClient, account_id: str, limit=100) -> list:
-    q = f"""{{blockchain{{account(account_id:"{account_id}" dapp_id:"{account_id}"){{
-      transactions(last:{limit} allow_latest_inconsistent_data:true){{
-        nodes{{now balance_delta_other{{currency value}}}}
-      }}
-    }}}}}}"""
-    data = await gql(client, q)
-    return (data.get("blockchain",{}).get("account",{})
-                .get("transactions",{}).get("nodes",[])) or []
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def is_addr(s: str) -> bool:
-    return bool(re.match(r'^-?\d+:[a-fA-F0-9]{64}$', s.strip())
-             or re.match(r'^[a-fA-F0-9]{64}$', s.strip()))
-
-def hex_id(addr: str) -> str:
-    m = re.match(r'^-?\d+:([a-fA-F0-9]{64})$', addr.strip())
-    return m.group(1).lower() if m else addr.strip().lower()
-
-def parse_balance_hex(val: str, decimals: int = 9) -> float:
-    """Parse hex OR decimal balance string → float. Mirrors index.html exactly."""
-    if not val or val == "0":
+# ── Balance parsing (mirrors index.html queryCurrency1Balance) ─────────────────
+def parse_hex_balance(val, decimals=9) -> float:
+    """
+    Parse hex or decimal balance string.
+    Mirrors: BigInt(valHex.startsWith('0x') ? valHex : '0x'+valHex) / 1e9
+    """
+    if not val or val in ("0", "", "0x0"):
         return 0.0
     try:
-        if isinstance(val, str) and val.startswith("0x"):
-            raw = int(val, 16)
-        elif isinstance(val, str) and re.match(r'^[0-9a-fA-F]+$', val) and not val.isdigit():
-            raw = int(val, 16)  # hex without 0x prefix
+        s = str(val)
+        if s.startswith("0x") or s.startswith("0X"):
+            raw = int(s, 16)
+        elif re.match(r'^[0-9a-fA-F]+$', s) and not s.isdigit():
+            raw = int("0x" + s, 16)  # hex without prefix
         else:
-            raw = int(val)      # decimal
+            raw = int(s)
         return raw / (10 ** decimals)
     except Exception:
         return 0.0
 
-def fmt(val: float, decimals: int = 2) -> str:
+def fmt_num(val: float, decimals=2) -> str:
     if val == 0:
         return "0.00"
     if val >= 1000:
         return f"{val:,.{decimals}f}"
     return f"{val:.{decimals}f}"
+
+# ── Address helpers ────────────────────────────────────────────────────────────
+def is_addr(s: str) -> bool:
+    s = s.strip()
+    return bool(re.match(r'^-?\d+:[a-fA-F0-9]{64}$', s)
+             or re.match(r'^[a-fA-F0-9]{64}$', s))
+
+def clean_hex(addr: str) -> str:
+    """Strip workchain prefix and 0x → bare 64-char hex. Mirrors index.html cleanHex()."""
+    if not addr:
+        return ""
+    h = addr.split(":")[-1] if ":" in addr else addr
+    h = re.sub(r'^0x', '', h, flags=re.IGNORECASE)
+    return h.lower()
+
+# ── GraphQL queries ────────────────────────────────────────────────────────────
+
+async def fetch_account_balances(client: httpx.AsyncClient, hex_id: str) -> dict:
+    """Fetch NACKL + USDC + SHELL balances for a wallet address."""
+    q = (f'{{blockchain{{account(account_id:"{hex_id}" dapp_id:"{hex_id}")'
+         f'{{info{{balance balance_other{{currency value}}}}}}}}}}')
+    data = await gql(client, q)
+    return data.get("blockchain", {}).get("account", {}).get("info") or {}
+
+async def fetch_locked_nackl(client: httpx.AsyncClient, popit_hex: str) -> float:
+    """
+    Mirrors index.html queryCurrency1Balance() exactly:
+      dappId = '0000...0001'  (NOT the popit address)
+      currency == 1  → NACKL locked
+      value is hex   → BigInt('0x'+val) / 1e9
+    """
+    q = (f'{{blockchain{{account(account_id:"{popit_hex}" dapp_id:"{POPIT_DAPP_ID}")'
+         f'{{info{{balance_other{{currency value}}}}}}}}}}')
+    data = await gql(client, q)
+    others = (data.get("blockchain", {}).get("account", {})
+                  .get("info", {}).get("balance_other")) or []
+    for c in others:
+        if str(c.get("currency")) == "1" or c.get("currency") == 1:
+            return parse_hex_balance(c.get("value", "0"))
+    return 0.0
+
+async def fetch_transactions(client: httpx.AsyncClient, hex_id: str, limit=100) -> list:
+    q = (f'{{blockchain{{account(account_id:"{hex_id}" dapp_id:"{hex_id}")'
+         f'{{transactions(last:{limit} allow_latest_inconsistent_data:true)'
+         f'{{nodes{{now balance_delta_other{{currency value}}}}}}}}}}}}')
+    data = await gql(client, q)
+    return ((data.get("blockchain", {}).get("account", {})
+                 .get("transactions", {}).get("nodes")) or [])
 
 # ── Wallet lookup ──────────────────────────────────────────────────────────────
 
@@ -170,113 +196,99 @@ async def lookup_wallet(identifier: str) -> dict:
 
         # ── 1. Resolve name → MvMultifactor address ───────────────────────────
         wallet_name: Optional[str] = None
-        mv_id: Optional[str]       = None
+        mv_hex: Optional[str]      = None
 
         if is_addr(identifier):
-            mv_id = hex_id(identifier)
+            mv_hex = clean_hex(identifier)
         else:
             wallet_name = identifier.lower()
-            # Use bee_sdk to get wallet address (mirrors index.html connectWallet)
             addr_str = await tvm_call("wallet_address", wallet_name)
-            log.info("bee_sdk wallet_address(%s) = %s", wallet_name, addr_str)
+            log.info("wallet_address(%s) = %s", wallet_name, addr_str)
 
-            if addr_str and addr_str != "None":
-                mv_id = hex_id(addr_str)
+            if addr_str:
+                mv_hex = clean_hex(addr_str)
             else:
                 raise ValueError(
                     f"Wallet *'{identifier}'* not found.\n"
                     "Try the full address:\n`/wallet 0:8c478bed...`"
                 )
 
-        # ── 2. Fetch MvMultifactor account ────────────────────────────────────
-        mv_info = await fetch_account(http, mv_id)
+        # ── 2. MvMultifactor balances ──────────────────────────────────────────
+        mv_info = await fetch_account_balances(http, mv_hex)
         if not mv_info:
-            raise ValueError(f"Account `0:{mv_id}` not found on chain.")
+            raise ValueError(f"Account `0:{mv_hex}` not found on chain.")
 
-        # ── 3. Parse balances exactly as index.html does ──────────────────────
-        # SHELL = native balance (hex string)
-        shell_val = parse_balance_hex(mv_info.get("balance", "0") or "0", SHELL_DEC)
+        # SHELL = native balance (hex)
+        shell_val = parse_hex_balance(mv_info.get("balance", "0") or "0")
 
-        # balance_other: currency=1 is NACKL, currency=3 is USDC
+        # balance_other: NACKL (id=1), USDC (id=3)
         nackl_val = 0.0
         usdc_val  = 0.0
         for b in mv_info.get("balance_other") or []:
-            cid = b.get("currency", -1)
-            v   = parse_balance_hex(b.get("value", "0") or "0", NACKL_DEC)
-            if cid == NACKL_ID:   nackl_val = v
-            elif cid == USDC_ID:  usdc_val  = v
+            cid = b.get("currency")
+            v   = parse_hex_balance(b.get("value", "0") or "0")
+            if cid == NACKL_ID or str(cid) == str(NACKL_ID):
+                nackl_val = v
+            elif cid == USDC_ID or str(cid) == str(USDC_ID):
+                usdc_val = v
 
-        # ── 4. Get PopitGame address via bee_sdk ──────────────────────────────
-        locked_val  = 0.0
-        mbi_level   = 0
-        popit_speed = 0.0
-        popit_found = False
-
+        # ── 3. PopitGame → locked NACKL ────────────────────────────────────────
+        locked_val = 0.0
         if wallet_name:
             popit_str = await tvm_call("popit_address", wallet_name)
-            log.info("bee_sdk popit_address(%s) = %s", wallet_name, popit_str)
-        else:
-            popit_str = None
+            log.info("popit_address(%s) = %s", wallet_name, popit_str)
+            if popit_str:
+                popit_hex  = clean_hex(popit_str)
+                locked_val = await fetch_locked_nackl(http, popit_hex)
 
-        if popit_str and popit_str != "None":
-            popit_hex = hex_id(popit_str)
-            popit_found = True
-
-            # Query locked NACKL exactly as index.html queryCurrency1Balance does:
-            # Uses dapp_id = "0000...0001" NOT the popit address itself
-            popit_info = await fetch_account(http, popit_hex, POPIT_DAPP_ID)
-            if popit_info:
-                for b in popit_info.get("balance_other") or []:
-                    if b.get("currency") == NACKL_ID:
-                        locked_val = parse_balance_hex(b.get("value","0") or "0", NACKL_DEC)
-
-        # ── 5. Transactions: speed + taps ─────────────────────────────────────
-        tx_speed = 0.0
-        taps     = 0
+        # ── 4. Transactions → speed (NACKL/24h) + total taps ──────────────────
+        speed_val = 0.0
+        taps_val  = 0
         try:
-            txns = await fetch_transactions(http, mv_id, limit=100)
+            txns = await fetch_transactions(http, mv_hex)
             if txns:
-                now_ts  = max((t.get("now", 0) for t in txns), default=0)
-                cutoff  = now_ts - 86400
-                earned  = 0.0
+                now_ts = max((t.get("now", 0) for t in txns), default=0)
+                cutoff = now_ts - 86400
+                earned = 0.0
                 for tx in txns:
                     ts = tx.get("now", 0)
                     for d in tx.get("balance_delta_other") or []:
-                        if d.get("currency") == NACKL_ID:
-                            v = parse_balance_hex(d.get("value","0") or "0", NACKL_DEC)
+                        cid = d.get("currency")
+                        if cid == NACKL_ID or str(cid) == str(NACKL_ID):
+                            v = parse_hex_balance(d.get("value", "0") or "0")
                             if v > 0:
                                 if ts >= cutoff:
                                     earned += v
-                                taps += 1
+                                taps_val += 1
                                 break
                 window_h = (now_ts - cutoff) / 3600 if now_ts > cutoff else 24
-                tx_speed = earned * (24 / max(window_h, 0.1))
+                speed_val = earned * (24 / max(window_h, 0.1))
         except Exception as e:
             log.warning("tx stats: %s", e)
 
         return {
-            "name":    wallet_name or f"0:{mv_id[:8]}...",
-            "address": f"0:{mv_id}",
+            "name":    wallet_name or f"0:{mv_hex[:8]}...",
+            "address": f"0:{mv_hex}",
             "nackl":   nackl_val,
             "locked":  locked_val,
             "usdc":    usdc_val,
             "shell":   shell_val,
-            "speed":   tx_speed,
-            "taps":    taps,
-            "mbi":     mbi_level,
+            "speed":   speed_val,
+            "taps":    taps_val,
+            "mbi":     0,   # requires TVM decode — not available without keys
         }
 
-# ── Format ─────────────────────────────────────────────────────────────────────
+# ── Message formatter ──────────────────────────────────────────────────────────
 
 def format_msg(w: dict) -> str:
     return "\n".join([
         "📊 *Wallet Info*\n",
         f"👤 {w['name']}",
-        f"🪙 NACKL: `{fmt(w['nackl'])}`",
-        f"🔒 Locked: `{fmt(w['locked'])}`",
-        f"💵 USDC: `{fmt(w['usdc'])}`",
-        f"🐚 SHELL: `{fmt(w['shell'], 4)}`",
-        f"⚡ Speed: `{fmt(w['speed'])} NACKL/24h`",
+        f"🪙 NACKL: `{fmt_num(w['nackl'])}`",
+        f"🔒 Locked: `{fmt_num(w['locked'])}`",
+        f"💵 USDC: `{fmt_num(w['usdc'])}`",
+        f"🐚 SHELL: `{fmt_num(w['shell'], 4)}`",
+        f"⚡ Speed: `{fmt_num(w['speed'])} NACKL/24h`",
         f"👆 Total taps: `{w['taps']}`",
         f"🎮 MBI Level: `{w['mbi']}`",
         f"\n📍 `{w['address']}`",
@@ -312,7 +324,7 @@ async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.exception("lookup error")
         await msg.edit_text(f"❌ Error: {e}")
 
-# ── Health server ──────────────────────────────────────────────────────────────
+# ── Health server (keeps Render alive) ────────────────────────────────────────
 class _H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
@@ -321,13 +333,13 @@ class _H(BaseHTTPRequestHandler):
 def _health():
     HTTPServer(("0.0.0.0", int(os.environ.get("PORT", 8080))), _H).serve_forever()
 
-# ── Entry ──────────────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def run_bot(token: str):
     threading.Thread(target=_health, daemon=True).start()
     start_tvm_server()
-    # Wait for Node.js TVM server to be ready
-    asyncio.get_event_loop().run_until_complete(wait_tvm_ready(30))
+    asyncio.run(wait_tvm_ready(30))
+
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
